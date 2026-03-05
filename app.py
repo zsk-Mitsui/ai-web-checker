@@ -25,126 +25,97 @@ class SuperSslContextAdapter(requests.adapters.HTTPAdapter):
         kwargs['ssl_context'] = ctx
         return super(SuperSslContextAdapter, self).init_poolmanager(*args, **kwargs)
 
-# --- サイドバー設定（修正版） ---
+# --- サイドバー設定 ---
 st.sidebar.title("🛠 設定")
-
-# Secretsにキーがあるか確認し、あればそれを使う。なければ入力欄を出す。
 default_api_key = st.secrets.get("GEMINI_API_KEY", "")
 api_key = st.sidebar.text_input("Gemini API Key", value=default_api_key, type="password")
-
 basic_user = st.sidebar.text_input("Basic認証 ユーザー名")
 basic_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
+# --- ヘルパー関数 ---
+@st.cache_resource
+def load_ai_model(api_key):
+    try:
+        genai.configure(api_key=api_key)
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        target = next((m for m in available_models if "gemini-1.5-flash" in m), available_models[0])
+        return genai.GenerativeModel(target)
+    except: return genai.GenerativeModel('gemini-1.5-flash')
+
+def generate_html_report(results):
+    rows_html = ""
+    for res in results:
+        issue_display = res['issue'].replace('\n', '<br>')
+        is_ok = "✅ 問題なし" in res['issue']
+        status_class = "" if is_ok else "status-error"
+        rows_html += f"<tr><td class='url-cell'><a href='{res['url']}' target='_blank'>{res['url']}</a></td><td><span class='{status_class}'>{issue_display}</span></td></tr>"
+
+    html_template = f"""<!DOCTYPE html><html lang='ja'><head><meta charset='UTF-8'><title>検品レポート</title><style>body{{font-family:sans-serif;color:#333;max-width:1100px;margin:30px auto;padding:20px;background:#f4f7f9;}}h1{{border-left:8px solid #3498db;padding-left:15px;font-size:24px;}}table{{width:100%;border-collapse:collapse;background:#fff;table-layout:fixed;}}th,td{{border:1px solid #eee;padding:14px;text-align:left;word-break:break-all;vertical-align:top;}}th{{background:#3498db;color:#fff;}}.url-cell{{font-size:12px;width:30%;}}.status-error{{color:#e74c3c;line-height:1.6;font-size:14px;}}</style></head><body><h1>🔍 Webサイト検品結果レポート</h1><table><thead><tr><th>調査対象ページ</th><th>AI検品 指摘事項</th></tr></thead><tbody>{rows_html}</tbody></table></body></html>"""
+    return html_template
+
 # --- アプリメイン ---
 st.title("🔍 HP納品前 AI自動検品ツール")
-st.write("sitemap.xml をアップロードして、AIによる精密検品を開始します。")
+st.write("sitemap.xml をアップロードして、精密検品を開始します。")
 
 uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
 
-# --- 修正後のモデル作成ロジック（app.pyの該当箇所を差し替え） ---
 if uploaded_file and api_key:
-    genai.configure(api_key=api_key)
-    
-    # 【最強の回避策】利用可能なモデルをリストアップし、動的に選択する
-    @st.cache_resource # モデルを毎回読み込まないようにキャッシュ
-    def load_ai_model(api_key):
-        try:
-            available_models = [m.name for m in genai.list_models() 
-                               if 'generateContent' in m.supported_generation_methods]
-            # gemini-1.5-flash を優先的に探す
-            target_model = next((m for m in available_models if "gemini-1.5-flash" in m), None)
-            # なければ最初に見つかった使えるモデルを使う
-            if not target_model:
-                target_model = available_models[0]
-            return genai.GenerativeModel(target_model)
-        except Exception as e:
-            st.error(f"モデル取得エラー: {e}")
-            # 最終手段の直書き
-            return genai.GenerativeModel('gemini-1.5-flash')
-
     model = load_ai_model(api_key)
-# ---------------------------------------------------------
-    
     session = requests.Session()
     session.mount('https://', SuperSslContextAdapter())
     session.verify = False
     auth_info = (basic_user, basic_pass) if basic_user else None
 
-    # URL抽出ロジック（Ver 18.0 継承）
     soup = BeautifulSoup(uploaded_file, 'xml')
     loc_tags = soup.find_all(re.compile(r'loc', re.I))
-    unique_urls = {}
-    for t in loc_tags:
-        url = t.text.strip()
-        if url.startswith('http'):
-            norm_key = url.rstrip('/')
-            if norm_key not in unique_urls: unique_urls[norm_key] = url
-    url_list = list(unique_urls.values())
+    url_list = list(set([t.text.strip() for t in loc_tags if t.text.strip().startswith('http')]))
 
     if st.button(f"{len(url_list)} ページの検品を開始"):
-        progress_bar = st.progress(0)
         results = []
-        checked_assets = {}
-        reported_dead_assets = set()
-
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
         for i, url in enumerate(url_list):
-            st.write(f"🔎 検品中: {url}")
-            
-            # --- ページ取得 & アセットチェック ---
+            status_text.text(f"⏳ {i+1}/{len(url_list)} ページ目を解析中: {url}")
             try:
                 res = session.get(url, auth=auth_info, timeout=20, verify=False)
                 res.encoding = res.apparent_encoding
                 html_text = res.text
                 
-                # アセット抽出と死活監視（Ver 14.1 / 16.2 継承）
-                dead_assets = []
-                soup_p = BeautifulSoup(html_text, 'html.parser')
-                asset_base = urljoin(url, soup_p.find('base')['href']) if soup_p.find('base') else url
-                
-                # 画像, CSS, JS, Iconの抽出
-                tags = {'img': 'src', 'link': 'href', 'script': 'src'}
-                found_assets = []
-                for tag, attr in tags.items():
-                    for item in soup_p.find_all(tag, **{attr: True}):
-                        if tag == 'link' and not any(r in str(item.get('rel')).lower() for r in ['icon', 'stylesheet']): continue
-                        found_assets.append(urljoin(asset_base, item[attr]))
-
-                for a_url in set(found_assets):
-                    if a_url not in checked_assets:
-                        try:
-                            h_res = session.head(a_url, auth=auth_info, timeout=5, verify=False)
-                            checked_assets[a_url] = h_res.status_code
-                        except: checked_assets[a_url] = 999
-                    if checked_assets[a_url] >= 400 and a_url not in reported_dead_assets:
-                        dead_assets.append(f"未検出({checked_assets[a_url]}): {a_url.split('/')[-1]}")
-                        reported_dead_assets.add(a_url)
-
-                # --- AI解析（Ver 18.0 継承） ---
+                # AI解析（Ver 18.0 準拠）
                 now = datetime.datetime.now()
-                prompt = f"""現在は{now.strftime('%Y年%m月')}。{now.year-1}年は過去。
+                prompt = f"""現在は{now.strftime('%Y年%m月')}。
                 URL: {url} の問題点を報告せよ。
-                1. 文字品質: ®、①、㈱等の環境依存文字、文字化け（等）、誤字脱字。
-                2. 電話番号不整合: 各所の番号違い。
+                1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
+                2. 電話番号不整合: 番号違い。
                 3. 鮮度: 未来の日付（{now.year}年{now.month}月より先）、他社名。
-                4. リンク切れ: {", ".join(dead_assets) if dead_assets else "なし"}
-                ※不備がない項目は出力厳禁。全て正常なら「なし」と回答。"""
+                4. メタ情報: descriptionの内容乖離。
+                不備がなければ「なし」と回答。"""
                 
                 ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
-                issue = ai_response.text.strip() if "なし" not in ai_response.text else ""
+                issue = ai_response.text.strip()
+                
+                # --- 「問題なし」を明示するロジック ---
+                if not issue or "なし" in issue or "問題ありません" in issue:
+                    issue = "✅ 問題なし"
+                
                 results.append({"url": url, "issue": issue})
-
             except Exception as e:
                 results.append({"url": url, "issue": f"⚠️ エラー: {str(e)}"})
-
+            
             progress_bar.progress((i + 1) / len(url_list))
-            time.sleep(1)
 
-        # --- レポート表示 ---
-        st.success("検品完了！")
+        st.success("全ての検品が完了しました！")
+        
+        # 画面に結果表示
+        df = pd.DataFrame(results)
+        st.table(df)
 
-        st.table(results)
-
-
-
-
-
+        # HTMLレポートダウンロード
+        report_html = generate_html_report(results)
+        st.download_button(
+            label="📄 検品レポート(HTML)をダウンロード",
+            data=report_html,
+            file_name=f"check_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.html",
+            mime="text/html"
+        )
