@@ -116,12 +116,11 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # --- 正確なベースURLの決定 ---
-                    # <base>タグがあれば優先、なければリダイレクト後の最終URLを使用
+                    # ベースURLの決定
                     base_tag = soup_p.find('base', href=True)
                     effective_base_url = base_tag['href'] if base_tag else res.url
                     
-                    # --- 1. 物理リンク切れチェック ---
+                    # --- 1. 物理リンク切れチェック（GETで検証） ---
                     dead_assets_found = []
                     potential_assets = []
                     for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
@@ -129,34 +128,37 @@ if uploaded_file and api_key:
                     for script in soup_p.find_all('script', src=True): potential_assets.append(script['src'])
                     for meta in soup_p.find_all('meta', content=True):
                         content = meta['content']
-                        if content.startswith(('http', '/')) or any(ext in content.lower() for ext in ['.jpg', '.png', '.webp', '.svg']):
+                        if content.startswith(('http', '/')) or any(ext in content.lower() for ext in ['.jpg', '.png', '.webp', '.svg', '.ico']):
                             potential_assets.append(content)
 
                     for asset_path in set(potential_assets):
                         asset_url = urljoin(effective_base_url, asset_path)
                         if asset_url not in global_checked_assets:
                             try:
-                                a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
+                                # HEADではなくGET(stream=True)で接続互換性を向上
+                                a_res = session.get(asset_url, auth=auth_info, timeout=10, verify=False, stream=True)
                                 global_checked_assets[asset_url] = a_res.status_code
-                            except: global_checked_assets[asset_url] = 999
+                                a_res.close()
+                            except Exception as e:
+                                global_checked_assets[asset_url] = 999
                         
                         if global_checked_assets[asset_url] >= 400:
                             if asset_url not in reported_dead_assets:
+                                # レポートにはフルURLを表示する
                                 dead_assets_found.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
                                 reported_dead_assets.add(asset_url)
 
-                    # --- 2. AIによる文字・整合性チェック（厳格設定維持） ---
+                    # --- 2. AIによる文字・内容チェック（厳格設定） ---
                     prompt = f"""現在は{datetime.datetime.now().strftime('%Y年%m月')}。
                     URL: {url} を【極めて厳格】に検品し、以下の不備のみを報告せよ。
 
-                    1. 文字品質（最優先・極めて厳格に）: 
-                       ・「お引きたえ」等の微細な誤字、送り仮名のミス、助詞の重複や脱字。
+                    1. 文字品質（最優先）: 
+                       ・「お引きたえ」「Abobe」等の微細な誤字。
                        ・環境依存文字（®、①、㈱、～等）の使用。
-                       ・文中や文末の不要な半角スペース、全角スペース、不自然な空白。
-                       ・文字化け。
-                    2. 電話番号不整合: サイト内の各所で番号が異なっていないか。
+                       ・文中や文末の不要な全角・半角スペース（特に「※1　光」のような空き）。
+                    2. 電話番号不整合: 各所の番号違い。
                     3. コンテンツ整合性: 別のサイトの使い回し、無関係な他社名の混入。
-                    4. メタ情報: descriptionに【他社の名前】や【無関係なサービス名】がある場合のみ報告。
+                    4. メタ情報: descriptionに無関係な他社名がある場合のみ。
 
                     不備がなければ『なし』とだけ回答せよ。"""
                     
