@@ -20,13 +20,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state.password_correct = False
-
     if st.session_state.password_correct:
         return True
-
     st.title("🔑 チーム専用：AI検品ディレクター")
     st.write("このツールは社内専用です。パスワードを入力してください。")
-    
     password_input = st.text_input("パスワード", type="password")
     if st.button("ログイン"):
         if password_input == st.secrets.get("TOOL_PASSWORD"):
@@ -36,11 +33,8 @@ def check_password():
             st.error("パスワードが正しくありません")
     return False
 
-# ログインしていない場合はここで処理を完全に止める
 if not check_password():
     st.stop()
-
-# --- 🔓 ここから下はログイン成功後のみ実行される ---
 
 class SuperSslContextAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -50,13 +44,6 @@ class SuperSslContextAdapter(requests.adapters.HTTPAdapter):
         ctx.verify_mode = ssl.CERT_NONE
         kwargs['ssl_context'] = ctx
         return super(SuperSslContextAdapter, self).init_poolmanager(*args, **kwargs)
-
-# --- サイドバー設定 ---
-st.sidebar.title("🛠 設定")
-default_api_key = st.secrets.get("GEMINI_API_KEY", "")
-api_key = st.sidebar.text_input("Gemini API Key", value=default_api_key, type="password")
-basic_user = st.sidebar.text_input("Basic認証 ユーザー名")
-basic_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
 # --- ヘルパー関数 ---
 @st.cache_resource
@@ -102,6 +89,12 @@ def generate_html_report(results):
 
 # --- アプリメイン ---
 st.title("🔍 HP納品前 AI自動検品ツール")
+st.sidebar.title("🛠 設定")
+default_api_key = st.secrets.get("GEMINI_API_KEY", "")
+api_key = st.sidebar.text_input("Gemini API Key", value=default_api_key, type="password")
+basic_user = st.sidebar.text_input("Basic認証 ユーザー名")
+basic_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
+
 uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
 
 if uploaded_file and api_key:
@@ -124,6 +117,10 @@ if uploaded_file and api_key:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
+        
+        # アセットの重複チェックを防ぐためのセット
+        global_checked_assets = {}
+
         for i, url in enumerate(url_list):
             status_text.text(f"⏳ {i+1}/{len(url_list)} ページ解析中: {url}")
             try:
@@ -133,19 +130,43 @@ if uploaded_file and api_key:
                     issue = f"⚠️ アクセス失敗(Status: {res.status_code})"
                     if res.status_code == 401: issue = "⚠️ 認証エラー(Basic認証の入力漏れ)"
                 else:
+                    html_text = res.text
+                    soup_p = BeautifulSoup(html_text, 'html.parser')
+                    
+                    # --- リンク切れ(画像等)の検証ロジック ---
+                    dead_assets = []
+                    asset_tags = {'img': 'src', 'link': 'href', 'script': 'src'}
+                    base_url = url
+                    for tag, attr in asset_tags.items():
+                        for item in soup_p.find_all(tag, **{attr: True}):
+                            asset_url = urljoin(base_url, item[attr])
+                            if asset_url not in global_checked_assets:
+                                try:
+                                    a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
+                                    global_checked_assets[asset_url] = a_res.status_code
+                                except:
+                                    global_checked_assets[asset_url] = 999
+                            
+                            if global_checked_assets[asset_url] >= 400:
+                                dead_assets.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url.split('/')[-1]}")
+
+                    # AIへのプロンプト（論理チェックを削除）
                     now = datetime.datetime.now()
-                    prompt = f"""現在は{now.strftime('%Y年%m月')}。
-                    URL: {url} の問題点（不備）のみを報告せよ。
+                    prompt = f"""URL: {url} の問題点（不備）のみを簡潔に報告せよ。
                     1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
-                    2. 電話番号不整合: 番号違い。
-                    3. 鮮度: 未来の日付（{now.year}年{now.month}月より先）、他社名。
-                    4. メタ情報: descriptionの内容乖離。
+                    2. 電話番号不整合: 各所の番号違い。
+                    3. メタ情報: descriptionの内容がページ固有ではなくサイト共通になっている等。
+                    4. リンク切れ: {", ".join(set(dead_assets)) if dead_assets else "なし"}
+
                     【厳守ルール】
-                    ・指摘事項がないカテゴリーの見出しは絶対に出力しないでください。
-                    ・「問題ありません」「見当たりません」といった正常報告は一切不要です。
-                    ・全体として不備が1つもなければ『なし』とだけ回答してください。"""
-                    ai_response = model.generate_content(prompt + "\n\nソース:\n" + res.text[:15000])
+                    ・「顧問年数の計算」などの論理チェックは不要です。
+                    ・不備がないカテゴリーの見出しは出力しないでください。
+                    ・「問題ありません」「見当たりません」等の正常報告は一切不要。
+                    ・全体として不備がなければ『なし』とだけ回答。"""
+                    
+                    ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
                     issue = clean_ai_response(ai_response.text.strip())
+                
                 results.append({"url": url, "issue": issue})
             except Exception as e:
                 results.append({"url": url, "issue": f"⚠️ エラー: {str(e)}"})
