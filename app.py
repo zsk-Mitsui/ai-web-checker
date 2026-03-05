@@ -116,11 +116,18 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # ベースURLの決定
-                    base_tag = soup_p.find('base', href=True)
-                    effective_base_url = base_tag['href'] if base_tag else res.url
+                    # ドメインとプロトコルを取得
+                    parsed_page = urlparse(res.url)
+                    domain_root = f"{parsed_page.scheme}://{parsed_page.netloc}"
                     
-                    # --- 1. 物理リンク切れチェック（GETで検証） ---
+                    # ベースURLの決定（必ず絶対URLにする）
+                    base_tag = soup_p.find('base', href=True)
+                    if base_tag:
+                        effective_base_url = urljoin(res.url, base_tag['href'])
+                    else:
+                        effective_base_url = res.url
+                    
+                    # --- 1. 物理リンク切れチェック ---
                     dead_assets_found = []
                     potential_assets = []
                     for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
@@ -128,34 +135,36 @@ if uploaded_file and api_key:
                     for script in soup_p.find_all('script', src=True): potential_assets.append(script['src'])
                     for meta in soup_p.find_all('meta', content=True):
                         content = meta['content']
-                        if content.startswith(('http', '/')) or any(ext in content.lower() for ext in ['.jpg', '.png', '.webp', '.svg', '.ico']):
+                        if content.startswith(('http', '/', './', '../')) or any(ext in content.lower() for ext in ['.jpg', '.png', '.webp', '.svg', '.ico']):
                             potential_assets.append(content)
 
                     for asset_path in set(potential_assets):
+                        # URLの解決を強化：ドメインがなければ現在のドメインを付与
                         asset_url = urljoin(effective_base_url, asset_path)
+                        if not urlparse(asset_url).netloc:
+                            asset_url = urljoin(domain_root, asset_path)
+
                         if asset_url not in global_checked_assets:
                             try:
-                                # HEADではなくGET(stream=True)で接続互換性を向上
+                                # GETでストリーム取得（接続互換性重視）
                                 a_res = session.get(asset_url, auth=auth_info, timeout=10, verify=False, stream=True)
                                 global_checked_assets[asset_url] = a_res.status_code
                                 a_res.close()
-                            except Exception as e:
+                            except Exception:
                                 global_checked_assets[asset_url] = 999
                         
                         if global_checked_assets[asset_url] >= 400:
                             if asset_url not in reported_dead_assets:
-                                # レポートにはフルURLを表示する
                                 dead_assets_found.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
                                 reported_dead_assets.add(asset_url)
 
-                    # --- 2. AIによる文字・内容チェック（厳格設定） ---
+                    # --- 2. AIによる文字・整合性チェック ---
                     prompt = f"""現在は{datetime.datetime.now().strftime('%Y年%m月')}。
-                    URL: {url} を【極めて厳格】に検品し、以下の不備のみを報告せよ。
+                    URL: {url} を【極めて厳格】に検品し、不備のみを報告せよ。
 
                     1. 文字品質（最優先）: 
-                       ・「お引きたえ」「Abobe」等の微細な誤字。
+                       ・誤字脱字、不要な半角・全角スペース（例：「※1　光」など）。
                        ・環境依存文字（®、①、㈱、～等）の使用。
-                       ・文中や文末の不要な全角・半角スペース（特に「※1　光」のような空き）。
                     2. 電話番号不整合: 各所の番号違い。
                     3. コンテンツ整合性: 別のサイトの使い回し、無関係な他社名の混入。
                     4. メタ情報: descriptionに無関係な他社名がある場合のみ。
