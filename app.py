@@ -117,6 +117,9 @@ if uploaded_file and api_key:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
+        
+        # すでに報告済みのリンク切れURLを記録するセット
+        reported_dead_assets = set()
         global_checked_assets = {}
 
         for i, url in enumerate(url_list):
@@ -130,8 +133,8 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # リンク切れチェック (meta/og含む)
-                    dead_assets = []
+                    # --- アセット死活監視 (重複排除ロジック付) ---
+                    dead_assets_to_report = []
                     potential_assets = []
                     for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
                     for link in soup_p.find_all('link', href=True): potential_assets.append(link['href'])
@@ -143,26 +146,29 @@ if uploaded_file and api_key:
 
                     for asset_path in set(potential_assets):
                         asset_url = urljoin(url, asset_path)
+                        # 未チェックならチェック実行
                         if asset_url not in global_checked_assets:
                             try:
                                 a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
                                 global_checked_assets[asset_url] = a_res.status_code
                             except: global_checked_assets[asset_url] = 999
+                        
+                        # 404かつ、まだこのレポート内で報告していない場合のみリストに追加
                         if global_checked_assets[asset_url] >= 400:
-                            dead_assets.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
+                            if asset_url not in reported_dead_assets:
+                                dead_assets_to_report.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
+                                reported_dead_assets.add(asset_url)
 
-                    # --- AIプロンプト：内容の整合性チェックを追加 ---
+                    # --- AIプロンプト ---
                     prompt = f"""URL: {url} の不備のみを報告せよ。
                     1. コンテンツの整合性（コピペ残骸の検出）:
                        ・本文中に、現在のサイトとは無関係な「他社名」「他サービス名」「別プロジェクトの記述」が混じっていないか。
-                       ・テンプレートのダミーテキストや、明らかに他サイトからの流用と思われる違和感のある文章はないか。
                     2. 文字品質: 
                        ・環境依存文字（®、①、㈱、～等）の使用。
-                       ・文中や文末の「不要な半角スペース」。
-                       ・誤字脱字、送り仮名のミス（例：「お引きたえ」はNG）。
+                       ・文中や文末の不要な半角スペース、誤字脱字、送り仮名ミス（「お引きたえ」等）。
                     3. 電話番号不整合: 各所の番号違い。
-                    4. メタ情報: descriptionが内容と【明らかに無関係】（他サイトの記述のまま等）。
-                    5. 物理エラー(自動検出済み): {", ".join(dead_assets) if dead_assets else "なし"}
+                    4. メタ情報: descriptionが内容と明らかに無関係。
+                    5. 物理エラー(新規検出): {", ".join(dead_assets_to_report) if dead_assets_to_report else "なし"}
 
                     【厳守ルール】
                     ・不備がないカテゴリーの見出しは出力しない。
