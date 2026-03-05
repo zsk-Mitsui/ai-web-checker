@@ -126,36 +126,48 @@ if uploaded_file and api_key:
                 res.encoding = res.apparent_encoding
                 if res.status_code != 200:
                     issue = f"⚠️ アクセス失敗(Status: {res.status_code})"
-                    if res.status_code == 401: issue = "⚠️ 認証エラー(Basic認証の入力漏れ)"
                 else:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # リンク切れチェック
+                    # リンク切れチェック (meta/og含む)
                     dead_assets = []
-                    asset_tags = {'img': 'src', 'link': 'href', 'script': 'src'}
-                    for tag, attr in asset_tags.items():
-                        for item in soup_p.find_all(tag, **{attr: True}):
-                            asset_url = urljoin(url, item[attr])
-                            if asset_url not in global_checked_assets:
-                                try:
-                                    a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
-                                    global_checked_assets[asset_url] = a_res.status_code
-                                except: global_checked_assets[asset_url] = 999
-                            if global_checked_assets[asset_url] >= 400:
-                                dead_assets.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url.split('/')[-1]}")
+                    potential_assets = []
+                    for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
+                    for link in soup_p.find_all('link', href=True): potential_assets.append(link['href'])
+                    for script in soup_p.find_all('script', src=True): potential_assets.append(script['src'])
+                    for meta in soup_p.find_all('meta', content=True):
+                        content = meta['content']
+                        if content.startswith(('http', '/')) or any(ext in content.lower() for ext in ['.jpg', '.png', '.webp', '.svg']):
+                            potential_assets.append(content)
 
-                    # AIプロンプト調整：致命的ミスを優先
-                    prompt = f"""URL: {url} の問題点（不備）のみを報告せよ。
-                    1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
-                    2. 電話番号不整合: 各所の番号違い。
-                    3. メタ情報: descriptionがページ内容と【明らかに無関係】（他サイトの記述、明らかなコピペ等）な場合のみ指摘せよ。※サイト共通の記述であることは許容する。
-                    4. リンク切れ: {", ".join(set(dead_assets)) if dead_assets else "なし"}
+                    for asset_path in set(potential_assets):
+                        asset_url = urljoin(url, asset_path)
+                        if asset_url not in global_checked_assets:
+                            try:
+                                a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
+                                global_checked_assets[asset_url] = a_res.status_code
+                            except: global_checked_assets[asset_url] = 999
+                        if global_checked_assets[asset_url] >= 400:
+                            dead_assets.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
+
+                    # --- AIプロンプト：内容の整合性チェックを追加 ---
+                    prompt = f"""URL: {url} の不備のみを報告せよ。
+                    1. コンテンツの整合性（コピペ残骸の検出）:
+                       ・本文中に、現在のサイトとは無関係な「他社名」「他サービス名」「別プロジェクトの記述」が混じっていないか。
+                       ・テンプレートのダミーテキストや、明らかに他サイトからの流用と思われる違和感のある文章はないか。
+                    2. 文字品質: 
+                       ・環境依存文字（®、①、㈱、～等）の使用。
+                       ・文中や文末の「不要な半角スペース」。
+                       ・誤字脱字、送り仮名のミス（例：「お引きたえ」はNG）。
+                    3. 電話番号不整合: 各所の番号違い。
+                    4. メタ情報: descriptionが内容と【明らかに無関係】（他サイトの記述のまま等）。
+                    5. 物理エラー(自動検出済み): {", ".join(dead_assets) if dead_assets else "なし"}
 
                     【厳守ルール】
-                    ・指摘事項がないカテゴリーの見出しは絶対に出力しないでください。
-                    ・「問題ありません」「見当たりません」等の正常報告は一切不要。
-                    ・全体として不備がなければ『なし』とだけ回答。"""
+                    ・不備がないカテゴリーの見出しは出力しない。
+                    ・「問題ありません」等の正常報告は不要。
+                    ・不備がなければ『なし』とだけ回答。"""
                     
                     ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
                     issue = clean_ai_response(ai_response.text.strip())
