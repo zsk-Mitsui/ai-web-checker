@@ -117,8 +117,6 @@ if uploaded_file and api_key:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        # すでに報告済みのリンク切れURLを記録するセット
         reported_dead_assets = set()
         global_checked_assets = {}
 
@@ -133,7 +131,7 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # --- アセット死活監視 (重複排除ロジック付) ---
+                    # リンク切れチェック
                     dead_assets_to_report = []
                     potential_assets = []
                     for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
@@ -146,34 +144,28 @@ if uploaded_file and api_key:
 
                     for asset_path in set(potential_assets):
                         asset_url = urljoin(url, asset_path)
-                        # 未チェックならチェック実行
                         if asset_url not in global_checked_assets:
                             try:
                                 a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
                                 global_checked_assets[asset_url] = a_res.status_code
                             except: global_checked_assets[asset_url] = 999
-                        
-                        # 404かつ、まだこのレポート内で報告していない場合のみリストに追加
                         if global_checked_assets[asset_url] >= 400:
                             if asset_url not in reported_dead_assets:
                                 dead_assets_to_report.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
                                 reported_dead_assets.add(asset_url)
 
-                    # --- AIプロンプト ---
+                    # --- AIプロンプト：メタ情報の指示をさらに緩和 ---
                     prompt = f"""URL: {url} の不備のみを報告せよ。
-                    1. コンテンツの整合性（コピペ残骸の検出）:
-                       ・本文中に、現在のサイトとは無関係な「他社名」「他サービス名」「別プロジェクトの記述」が混じっていないか。
-                    2. 文字品質: 
-                       ・環境依存文字（®、①、㈱、～等）の使用。
-                       ・文中や文末の不要な半角スペース、誤字脱字、送り仮名ミス（「お引きたえ」等）。
-                    3. 電話番号不整合: 各所の番号違い。
-                    4. メタ情報: descriptionが内容と明らかに無関係。
-                    5. 物理エラー(新規検出): {", ".join(dead_assets_to_report) if dead_assets_to_report else "なし"}
+                    1. コンテンツ整合性: 別のサイトの使い回し、無関係な他社名の混入。
+                    2. 文字品質: 環境依存文字、不要な半角スペース、誤字脱字。
+                    3. メタ情報: 
+                       ※【重要】会社概要などの『サイト共通のdescription』は正常（問題なし）として扱ってください。
+                       ※他社の名前や全く無関係なサービス名が入っている場合のみ報告してください。
+                    4. 物理エラー: {", ".join(dead_assets_to_report) if dead_assets_to_report else "なし"}
 
                     【厳守ルール】
-                    ・不備がないカテゴリーの見出しは出力しない。
-                    ・「問題ありません」等の正常報告は不要。
-                    ・不備がなければ『なし』とだけ回答。"""
+                    ・不備がない見出しは出さない。
+                    ・「問題なし」系の言葉は『なし』とだけ回答。"""
                     
                     ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
                     issue = clean_ai_response(ai_response.text.strip())
