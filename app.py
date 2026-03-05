@@ -117,8 +117,6 @@ if uploaded_file and api_key:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        # アセットの重複チェックを防ぐためのセット
         global_checked_assets = {}
 
         for i, url in enumerate(url_list):
@@ -133,34 +131,29 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # --- リンク切れ(画像等)の検証ロジック ---
+                    # リンク切れチェック
                     dead_assets = []
                     asset_tags = {'img': 'src', 'link': 'href', 'script': 'src'}
-                    base_url = url
                     for tag, attr in asset_tags.items():
                         for item in soup_p.find_all(tag, **{attr: True}):
-                            asset_url = urljoin(base_url, item[attr])
+                            asset_url = urljoin(url, item[attr])
                             if asset_url not in global_checked_assets:
                                 try:
                                     a_res = session.head(asset_url, auth=auth_info, timeout=5, verify=False)
                                     global_checked_assets[asset_url] = a_res.status_code
-                                except:
-                                    global_checked_assets[asset_url] = 999
-                            
+                                except: global_checked_assets[asset_url] = 999
                             if global_checked_assets[asset_url] >= 400:
                                 dead_assets.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url.split('/')[-1]}")
 
-                    # AIへのプロンプト（論理チェックを削除）
-                    now = datetime.datetime.now()
-                    prompt = f"""URL: {url} の問題点（不備）のみを簡潔に報告せよ。
+                    # AIプロンプト調整：致命的ミスを優先
+                    prompt = f"""URL: {url} の問題点（不備）のみを報告せよ。
                     1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
                     2. 電話番号不整合: 各所の番号違い。
-                    3. メタ情報: descriptionの内容がページ固有ではなくサイト共通になっている等。
+                    3. メタ情報: descriptionがページ内容と【明らかに無関係】（他サイトの記述、明らかなコピペ等）な場合のみ指摘せよ。※サイト共通の記述であることは許容する。
                     4. リンク切れ: {", ".join(set(dead_assets)) if dead_assets else "なし"}
 
                     【厳守ルール】
-                    ・「顧問年数の計算」などの論理チェックは不要です。
-                    ・不備がないカテゴリーの見出しは出力しないでください。
+                    ・指摘事項がないカテゴリーの見出しは絶対に出力しないでください。
                     ・「問題ありません」「見当たりません」等の正常報告は一切不要。
                     ・全体として不備がなければ『なし』とだけ回答。"""
                     
