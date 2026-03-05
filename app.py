@@ -36,6 +36,10 @@ def check_password():
 if not check_password():
     st.stop()
 
+# --- 内部で使用するAPIキーの取得 ---
+# 画面には出さず、Secretsから直接取得します
+INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+
 class SuperSslContextAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         ctx = ssl.create_default_context()
@@ -74,16 +78,22 @@ def generate_html_report(results):
 
 # --- アプリメイン ---
 st.title("🔍 HP納品前 AI自動検品ツール")
-st.sidebar.title("🛠 設定")
-default_api_key = st.secrets.get("GEMINI_API_KEY", "")
-api_key = st.sidebar.text_input("Gemini API Key", value=default_api_key, type="password")
+
+# --- サイドバー設定（APIキー入力を削除） ---
+st.sidebar.title("🛠 検品オプション")
+st.sidebar.write("対象サイトにBasic認証がかかっている場合は入力してください。")
 basic_user = st.sidebar.text_input("Basic認証 ユーザー名")
 basic_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
 uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
 
-if uploaded_file and api_key:
-    model = load_ai_model(api_key)
+# APIキーがSecretsに設定されているかチェック
+if not INTERNAL_API_KEY:
+    st.error("エラー: Gemini API Key が設定されていません。Streamlit CloudのSecretsを確認してください。")
+    st.stop()
+
+if uploaded_file:
+    model = load_ai_model(INTERNAL_API_KEY)
     session = requests.Session()
     session.mount('https://', SuperSslContextAdapter())
     session.verify = False
@@ -116,18 +126,12 @@ if uploaded_file and api_key:
                     html_text = res.text
                     soup_p = BeautifulSoup(html_text, 'html.parser')
                     
-                    # ドメインとプロトコルを取得
                     parsed_page = urlparse(res.url)
                     domain_root = f"{parsed_page.scheme}://{parsed_page.netloc}"
-                    
-                    # ベースURLの決定（必ず絶対URLにする）
                     base_tag = soup_p.find('base', href=True)
-                    if base_tag:
-                        effective_base_url = urljoin(res.url, base_tag['href'])
-                    else:
-                        effective_base_url = res.url
+                    effective_base_url = urljoin(res.url, base_tag['href']) if base_tag else res.url
                     
-                    # --- 1. 物理リンク切れチェック ---
+                    # リンク切れチェック
                     dead_assets_found = []
                     potential_assets = []
                     for img in soup_p.find_all('img', src=True): potential_assets.append(img['src'])
@@ -139,14 +143,12 @@ if uploaded_file and api_key:
                             potential_assets.append(content)
 
                     for asset_path in set(potential_assets):
-                        # URLの解決を強化：ドメインがなければ現在のドメインを付与
                         asset_url = urljoin(effective_base_url, asset_path)
                         if not urlparse(asset_url).netloc:
                             asset_url = urljoin(domain_root, asset_path)
 
                         if asset_url not in global_checked_assets:
                             try:
-                                # GETでストリーム取得（接続互換性重視）
                                 a_res = session.get(asset_url, auth=auth_info, timeout=10, verify=False, stream=True)
                                 global_checked_assets[asset_url] = a_res.status_code
                                 a_res.close()
@@ -158,16 +160,15 @@ if uploaded_file and api_key:
                                 dead_assets_found.append(f"❌ リンク切れ({global_checked_assets[asset_url]}): {asset_url}")
                                 reported_dead_assets.add(asset_url)
 
-                    # --- 2. AIによる文字・整合性チェック ---
+                    # AIプロンプト
                     prompt = f"""現在は{datetime.datetime.now().strftime('%Y年%m月')}。
                     URL: {url} を【極めて厳格】に検品し、不備のみを報告せよ。
 
                     1. 文字品質（最優先）: 
-                       ・誤字脱字、不要な半角・全角スペース（例：「※1　光」など）。
-                       ・環境依存文字（®、①、㈱、～等）の使用。
+                       ・誤字脱字、送り仮名ミス、不要なスペース、環境依存文字の使用。
                     2. 電話番号不整合: 各所の番号違い。
-                    3. コンテンツ整合性: 別のサイトの使い回し、無関係な他社名の混入。
-                    4. メタ情報: descriptionに無関係な他社名がある場合のみ。
+                    3. コンテンツ整合性: 他社名の混入など。
+                    4. メタ情報: descriptionに無関係な他社名がある場合。
 
                     不備がなければ『なし』とだけ回答せよ。"""
                     
