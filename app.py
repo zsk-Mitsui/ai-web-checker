@@ -25,9 +25,13 @@ class SuperSslContextAdapter(requests.adapters.HTTPAdapter):
         kwargs['ssl_context'] = ctx
         return super(SuperSslContextAdapter, self).init_poolmanager(*args, **kwargs)
 
-# --- サイドバー設定 ---
+# --- サイドバー設定（修正版） ---
 st.sidebar.title("🛠 設定")
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
+
+# Secretsにキーがあるか確認し、あればそれを使う。なければ入力欄を出す。
+default_api_key = st.secrets.get("GEMINI_API_KEY", "")
+api_key = st.sidebar.text_input("Gemini API Key", value=default_api_key, type="password")
+
 basic_user = st.sidebar.text_input("Basic認証 ユーザー名")
 basic_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
@@ -117,4 +121,5 @@ if uploaded_file and api_key:
 
         # --- レポート表示 ---
         st.success("検品完了！")
+
         st.table(results)
