@@ -75,34 +75,48 @@ if uploaded_file and api_key:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, url in enumerate(url_list):
+       for i, url in enumerate(url_list):
             status_text.text(f"⏳ {i+1}/{len(url_list)} ページ目を解析中: {url}")
             try:
+                # ページを取得
                 res = session.get(url, auth=auth_info, timeout=20, verify=False)
                 res.encoding = res.apparent_encoding
-                html_text = res.text
                 
-                # AI解析（Ver 18.0 準拠）
-                now = datetime.datetime.now()
-                prompt = f"""現在は{now.strftime('%Y年%m月')}。
-                URL: {url} の問題点を報告せよ。
-                1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
-                2. 電話番号不整合: 番号違い。
-                3. 鮮度: 未来の日付（{now.year}年{now.month}月より先）、他社名。
-                4. メタ情報: descriptionの内容乖離。
-                不備がなければ「なし」と回答。"""
+                # --- ① ステータスコードの判定（401エラー等のノイズ除去） ---
+                if res.status_code == 401:
+                    issue = "⚠️ ウェブサイトにアクセスできませんでした。（ベーシック認証の入力漏れ・誤りの可能性があります）"
+                elif res.status_code == 404:
+                    issue = "⚠️ ウェブサイトにアクセスできませんでした。（ページが見つかりません/404）"
+                elif res.status_code != 200:
+                    issue = f"⚠️ ウェブサイトにアクセスできませんでした。（Status: {res.status_code}）"
+                else:
+                    # --- ② 正常(200)な場合のみ詳細な解析を実行 ---
+                    html_text = res.text
+                    
+                    # AI解析用のプロンプト（Ver 19.0 準拠）
+                    now = datetime.datetime.now()
+                    prompt = f"""現在は{now.strftime('%Y年%m月')}。
+                    URL: {url} の問題点を報告せよ。
+                    1. 文字品質: ®、①、㈱等の環境依存文字、文字化け、誤字脱字。
+                    2. 電話番号不整合: 番号違い。
+                    3. 鮮度: 未来の日付（{now.year}年{now.month}月より先）、他社名。
+                    4. メタ情報: descriptionの内容乖離。
+                    不備がなければ「なし」と回答。"""
+                    
+                    ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
+                    issue = ai_response.text.strip()
+                    
+                    # 指摘がない場合は「問題なし」に変換
+                    if not issue or "なし" in issue or "問題ありません" in issue:
+                        issue = "✅ 問題なし"
                 
-                ai_response = model.generate_content(prompt + "\n\nソース:\n" + html_text[:15000])
-                issue = ai_response.text.strip()
-                
-                # --- 「問題なし」を明示するロジック ---
-                if not issue or "なし" in issue or "問題ありません" in issue:
-                    issue = "✅ 問題なし"
-                
+                # 結果をリストに追加
                 results.append({"url": url, "issue": issue})
+
             except Exception as e:
                 results.append({"url": url, "issue": f"⚠️ エラー: {str(e)}"})
             
+            # 進捗を更新
             progress_bar.progress((i + 1) / len(url_list))
 
         st.success("全ての検品が完了しました！")
@@ -119,3 +133,4 @@ if uploaded_file and api_key:
             file_name=f"check_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.html",
             mime="text/html"
         )
+
