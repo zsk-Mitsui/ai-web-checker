@@ -1,6 +1,6 @@
 streamlit
 requests
 beautifulsoup4
-google-generativeai>=0.5.0
+google-generativeai>=0.5.2
 pandas
 lxml
