@@ -43,7 +43,11 @@ uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml"
 
 if uploaded_file and api_key:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('models/gemini-1.5-flash')
+    # 修正前：
+    # model = genai.GenerativeModel('models/gemini-1.5-flash')
+
+    # 修正後：models/ を取り除き、名前だけで指定します
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     session = requests.Session()
     session.mount('https://', SuperSslContextAdapter())
@@ -123,4 +127,5 @@ if uploaded_file and api_key:
         st.success("検品完了！")
 
         st.table(results)
+
 
