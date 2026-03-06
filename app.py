@@ -9,6 +9,7 @@ import urllib3
 import ssl
 import datetime
 import os
+import html as html_lib  # 特殊文字処理用
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -37,7 +38,7 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 51.0 | 画面レポートHTML同期 ＆ 行番号表示 ＆ メタ資産監視")
+st.caption("Ver. 52.0 | エラー回避エスケープ実装 ＆ 大容量対応 ＆ メタ資産監視")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -79,7 +80,7 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         soup = BeautifulSoup(raw_html, 'html.parser')
         effective_base = urljoin(res.url, soup.find('base', href=True)['href']) if soup.find('base', href=True) else res.url
         
-        # 資産抽出（Meta/OGP含む強化版）
+        # 資産抽出
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
@@ -115,8 +116,8 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         4. コピペの痕跡: alt属性や本文の他社名残り。
         【スペース判定ルール】
         ・「 | 」や「 - 」で区切られたタイトル・パンくず内のスペースは「デザイン」としてスルー。それ以外の文章内の不自然なスペースは厳しく指摘。
-        【出力ルール】
-        ・アドバイスや正常報告は不要。不備がある場合のみ簡潔に報告。不備がなければ『なし』。"""
+        【禁止事項】
+        ・主観的なアドバイスや正常報告は不要。不備がある場合のみ簡潔に報告。不備がなければ『なし』。"""
         
         ai_issue = ""
         try:
@@ -160,16 +161,21 @@ if uploaded_file and INTERNAL_API_KEY:
 
         st.success("検品完了！")
         
-        # --- 🚀 画面表示用HTMLテーブル生成 ---
+        # --- 🚀 安全なHTMLテーブル生成 (エスケープ処理追加) ---
         html_rows = ""
         for r in results:
             color = "#e74c3c" if "✅" not in r['issue'] else "#333"
-            html_rows += f"<tr><td style='font-size:12px;width:30%;padding:12px;border:1px solid #eee;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td>"
-            html_rows += f"<td style='padding:12px;border:1px solid #eee;'><span style='color:{color};white-space:pre-wrap;'>{r['issue'].replace('\n','<br>')}</span></td></tr>"
+            # URLと指摘事項を安全にエスケープしてから埋め込む
+            safe_url = html_lib.escape(r['url'])
+            # 指摘事項はエスケープしてから改行だけ<br>に戻す
+            safe_issue = html_lib.escape(r['issue']).replace('\n', '<br>')
+            
+            html_rows += f"<tr><td style='font-size:12px;width:30%;padding:12px;border:1px solid #eee;'><a href='{safe_url}' target='_blank'>{safe_url}</a></td>"
+            html_rows += f"<td style='padding:12px;border:1px solid #eee;'><span style='color:{color};white-space:pre-wrap;'>{safe_issue}</span></td></tr>"
         
         full_html_table = f"""
-        <div style="background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.05);">
-            <table style="width:100%; border-collapse:collapse; font-family:sans-serif;">
+        <div style="background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.05); overflow-x: auto;">
+            <table style="width:100%; border-collapse:collapse; font-family:sans-serif; min-width: 800px;">
                 <thead style="background:#3498db; color:#fff;">
                     <tr><th style="padding:12px; text-align:left;">URL</th><th style="padding:12px; text-align:left;">指摘事項</th></tr>
                 </thead>
@@ -177,11 +183,8 @@ if uploaded_file and INTERNAL_API_KEY:
             </table>
         </div>
         """
-        
-        # 画面にHTMLを埋め込む
         st.write("### 🔍 検品結果プレビュー")
         st.write(full_html_table, unsafe_allow_html=True)
         
-        # ダウンロード用HTML全体
         download_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}table{{width:100%;border-collapse:collapse;background:#fff;}}th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}th{{background:#3498db;color:#fff;}}</style></head><body><h1>🔍 {sitemap_stem} レポート</h1><table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
         st.download_button(label=f"📄 {report_name} をダウンロード", data=download_html, file_name=report_name, mime="text/html")
