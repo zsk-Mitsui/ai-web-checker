@@ -74,7 +74,6 @@ def load_ai_model(api_key):
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
     try:
-        # ページ取得
         res = session.get(url, auth=auth_info, timeout=20, verify=False)
         res.encoding = res.apparent_encoding
         if res.status_code != 200:
@@ -84,7 +83,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         base_tag = soup.find('base', href=True)
         effective_base = urljoin(res.url, base_tag['href']) if base_tag else res.url
         
-        # 資産（画像・JS・CSS等）の抽出
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
@@ -94,12 +92,10 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
             if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg']):
                 assets.add(urljoin(effective_base, content))
 
-        # リンク切れの死活監視
         dead_results = []
         for a_url in assets:
             if a_url not in global_checked_assets:
                 try:
-                    # GETで疎通確認
                     a_res = session.get(a_url, auth=auth_info, timeout=10, verify=False, stream=True)
                     global_checked_assets[a_url] = a_res.status_code
                     a_res.close()
@@ -111,7 +107,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                     dead_results.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
-        # AI解析プロンプト
         now_str = datetime.datetime.now().strftime('%Y年%m月')
         prompt = f"現在は{now_str}。URL: {url} を極めて厳格に検品せよ。\n" \
                  "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース(半角・全角)、環境依存文字。\n" \
@@ -127,34 +122,10 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         except Exception as e:
             ai_issue = f"⚠️ AIエラー: {str(e)}"
 
-        # 結果合成
         final_list = []
         if dead_results:
             final_list.append("**物理エラー**\n" + "\n".join(dead_results))
         if ai_issue:
             final_list.append("**検品指摘**\n" + ai_issue)
             
-        return {"url": url, "issue": "\n\n".join(final_list) if final_list else "✅ 問題なし"}
-
-    except Exception as e:
-        return {"url": url, "issue": f"⚠️ エラー発生: {str(e)}"}
-
-# --- 6. メインUI ---
-st.sidebar.title("🛠 設定")
-b_user = st.sidebar.text_input("Basic認証 ユーザー名")
-b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
-
-uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
-
-if uploaded_file and INTERNAL_API_KEY:
-    # サイトマップ名からファイル名を動的に生成
-    sitemap_stem = os.path.splitext(uploaded_file.name)[0]
-    date_label = datetime.date.today().strftime('%Y-%m-%d')
-    report_name = f"{sitemap_stem}_report_{date_label}.html"
-
-    model = load_ai_model(INTERNAL_API_KEY)
-    session = get_session()
-    auth = (b_user, b_pass) if b_user else None
-
-    # Sitemap解析
-    xml_
+        return {"url": url, "issue": "\n\n".join
