@@ -39,7 +39,7 @@ if not check_password():
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# --- 3. ネットワーク通信クラス ---
+# --- 3. ネットワーク通信設定 ---
 def get_session():
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -60,7 +60,6 @@ def get_session():
 def load_ai_model(api_key):
     try:
         genai.configure(api_key=api_key)
-        # 利用可能なモデルを順に試す
         for m_name in ['gemini-1.5-pro', 'gemini-1.5-flash']:
             try:
                 m = genai.GenerativeModel(m_name)
@@ -75,7 +74,6 @@ def load_ai_model(api_key):
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
     try:
-        # ページ取得
         res = session.get(url, auth=auth_info, timeout=20, verify=False)
         res.encoding = res.apparent_encoding
         if res.status_code != 200:
@@ -85,7 +83,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         base_tag = soup.find('base', href=True)
         effective_base = urljoin(res.url, base_tag['href']) if base_tag else res.url
         
-        # 物理リンク（画像・JS・CSS・Meta）の抽出
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
@@ -95,7 +92,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
             if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg']):
                 assets.add(urljoin(effective_base, content))
 
-        # リンク切れの死活監視
         dead_results = []
         for a_url in assets:
             if a_url not in global_checked_assets:
@@ -110,7 +106,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                     dead_results.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
-        # AI解析プロンプト
         now_str = datetime.datetime.now().strftime('%Y年%m月')
         prompt = f"現在は{now_str}。URL: {url} を極めて厳格に検品せよ。\n" \
                  "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース、環境依存文字。\n" \
@@ -126,7 +121,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         except Exception as e:
             ai_issue = f"⚠️ AIエラー: {str(e)}"
 
-        # レポート合成
         final_list = []
         if dead_results:
             final_list.append("**物理エラー**\n" + "\n".join(dead_results))
@@ -134,5 +128,58 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
             final_list.append("**検品指摘**\n" + ai_issue)
             
         return {"url": url, "issue": "\n\n".join(final_list) if final_list else "✅ 問題なし"}
-
     except Exception as e:
+        return {"url": url, "issue": f"⚠️ エラー発生: {str(e)}"}
+
+# --- 6. メインUI ---
+st.sidebar.title("🛠 設定")
+b_user = st.sidebar.text_input("Basic認証 ユーザー名")
+b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
+
+uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
+
+if uploaded_file and INTERNAL_API_KEY:
+    sitemap_stem = os.path.splitext(uploaded_file.name)[0]
+    date_label = datetime.date.today().strftime('%Y-%m-%d')
+    report_name = f"{sitemap_stem}_report_{date_label}.html"
+
+    model = load_ai_model(INTERNAL_API_KEY)
+    session = get_session()
+    auth = (b_user, b_pass) if b_user else None
+
+    xml_soup = BeautifulSoup(uploaded_file, 'xml')
+    urls = []
+    for loc in xml_soup.find_all(re.compile(r'loc', re.I)):
+        u = loc.text.strip().rstrip('/')
+        if u.startswith('http'):
+            urls.append(u)
+    unique_urls = list(dict.fromkeys(urls))
+
+    if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
+        if not model:
+            st.error("AIモデルの初期化に失敗しました。")
+            st.stop()
+            
+        results = []
+        reported_dead = set()
+        checked_cache = {}
+        prog = st.progress(0)
+        status = st.empty()
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_url = {executor.submit(inspect_single_page, u, model, session, auth, reported_dead, checked_cache): u for u in unique_urls}
+            for i, future in enumerate(as_completed(future_to_url)):
+                try:
+                    data = future.result()
+                except Exception as e:
+                    data = {"url": "不明", "issue": f"⚠️ システムエラー: {str(e)}"}
+                results.append(data)
+                prog.progress((i + 1) / len(unique_urls))
+                status.text(f"完了: {i+1}/{len(unique_urls)} - {data.get('url')}")
+
+        st.success("検品が完了しました！")
+        st.table(pd.DataFrame(results))
+        
+        html_rows = ""
+        for r in results:
+            color = "#e74c3c" if "✅" not in r['issue']
