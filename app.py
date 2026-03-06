@@ -137,12 +137,11 @@ st.sidebar.title("🛠 設定")
 b_user = st.sidebar.text_input("Basic認証 ユーザー名")
 b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
-uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
+# アップロード可能なファイルを .xml と .txt に拡張
+uploaded_file = st.file_uploader("URLリスト (.xml または .txt) をアップロード", type=["xml", "txt"])
 
 if uploaded_file and INTERNAL_API_KEY:
-    # サイトマップファイル名を取得
-    filename_raw = uploaded_file.name
-    sitemap_stem = os.path.splitext(filename_raw)[0]
+    sitemap_stem = os.path.splitext(uploaded_file.name)[0]
     date_label = datetime.date.today().strftime('%Y-%m-%d')
     report_name = f"{sitemap_stem}_report_{date_label}.html"
 
@@ -150,15 +149,22 @@ if uploaded_file and INTERNAL_API_KEY:
     session = get_session()
     auth = (b_user, b_pass) if b_user else None
 
-    # Sitemap解析
-    sitemap_data = uploaded_file.read()
-    xml_soup = BeautifulSoup(sitemap_data, 'xml')
-    
+    # ファイル形式に応じたURL解析
+    raw_content = uploaded_file.read().decode("utf-8")
     unique_urls = []
-    for loc in xml_soup.find_all(re.compile(r'loc', re.I)):
-        u = loc.text.strip().rstrip('/')
-        if u.startswith('http') and u not in unique_urls:
-            unique_urls.append(u)
+    
+    if uploaded_file.name.endswith(".xml"):
+        soup = BeautifulSoup(raw_content, 'xml')
+        for loc in soup.find_all(re.compile(r'loc', re.I)):
+            u = loc.text.strip().rstrip('/')
+            if u.startswith('http') and u not in unique_urls:
+                unique_urls.append(u)
+    else:
+        # .txt の場合は1行1URLとして処理
+        for line in raw_content.splitlines():
+            u = line.strip().rstrip('/')
+            if u.startswith('http') and u not in unique_urls:
+                unique_urls.append(u)
 
     if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
         if not model:
@@ -171,7 +177,6 @@ if uploaded_file and INTERNAL_API_KEY:
         prog = st.progress(0)
         status = st.empty()
         
-        # 並列処理実行
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_url = {executor.submit(inspect_single_page, u, model, session, auth, reported_dead, checked_cache): u for u in unique_urls}
             for i, future in enumerate(as_completed(future_to_url)):
