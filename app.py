@@ -37,9 +37,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 🚀 ログイン後のタイトル表示 ---
-st.title("🔍 Web検品ディレクター Pro (Ver. 47.0)")
-st.caption("AIによる一字一句の厳密デバッグ ＆ 物理リンク切れチェック")
+# --- 🚀 ログイン後のタイトル表示（Ver. 48.0） ---
+st.title("🔍 Web検品ディレクター Pro")
+st.caption("Ver. 48.0 | 高解像度文字列スキャンモード搭載")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -80,16 +80,13 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         soup = BeautifulSoup(res.text, 'html.parser')
         effective_base = urljoin(res.url, soup.find('base', href=True)['href']) if soup.find('base', href=True) else res.url
         
-        # リンク切れチェック
+        # 資産の抽出
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
                 assets.add(urljoin(effective_base, item[attr]))
-        for meta in soup.find_all('meta', content=True):
-            content = meta['content']
-            if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg']):
-                assets.add(urljoin(effective_base, content))
 
+        # リンク切れの死活監視
         dead_results = []
         for a_url in assets:
             if a_url not in global_checked_assets:
@@ -102,31 +99,37 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                     dead_results.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
-        # --- AIデバッグプロンプト（高解像度版） ---
-        prompt = f"""あなたは「Webサイトの物理的・論理的欠陥」を1文字単位でスキャンするデバッグ・プログラムです。
-        URL: {url} のソースを「文章として読まず、文字コードの羅列」として解析し、以下の不備を報告せよ。
+        # --- AIプロンプト（超・文字列スキャン仕様） ---
+        prompt = f"""あなたは「Webサイトの物理的な記述バグ」を摘出する、極めて冷徹な文字列スキャナーです。
+        URL: {url} のソースを「意味を持つ文章」としてではなく、「一字一句のコード」として精密にスキャンし、以下の不備を特定せよ。
 
-        【デバッグ項目（機械的に抽出せよ）】
-        1. 文字品質の欠陥: 
-           ・一文字の誤字（例：「お引きたえ」「Abobe」等）。
-           ・単語内への不要な空白の混入（例：「発 生」）。
-           ・助詞の重複や脱字（例：「〜をを快適に」「自分せい」）。
-           ・環境依存文字（～, ①, ㈱等）。
-        2. 表記の不一致: ページ内で同一の言葉（例：お問い合わせ）が異なる表記で混在している。
-        3. 物理的不整合: 電話番号の不一致、新着情報の日付とdatetime属性の食い違い。
-        4. コピペの残骸: 他社名や明らかに無関係なプロジェクト名の記述。
+        【デバッグ指示（脳内補完を禁止し、1文字ずつ照合せよ）】
+        1. 物理的な文字バグ:
+           ・1文字の誤字（例：お引きたえ、Abobe 等）。
+           ・単語内や文中に紛れ込んだ不要な半角・全角スペース（例：「発 生」、「ありません。 お客さま」）。
+           ・助詞の重複や欠落（例：「〜をを快適に」、「自分せい」）。
+           ・文字化け、および環境依存文字（～, ① 等）。
+        2. 表記の不統一（重大なもの）:
+           ・「お問い合わせ」と「お問合せ」など、同一ページ内での表記揺れ。
+        3. ロジカル不整合:
+           ・ページ内で異なる電話番号が表示されている。
+           ・新着情報の日付とdatetime属性の年が食い違っている。
+        4. コピペの痕跡:
+           ・他社名や無関係なサービス名が残存している。
 
-        【厳守ルール】
-        ・AIによる「脳内補完」を禁止します。一字一句ソース通りに照合してください。
-        ・主観的な文章のアドバイスや添削は一切不要です。
-        ・「問題ありません」等の正常報告や空の見出しは絶対に出力せず、不備がある場合のみ箇条書きで出力してください。
+        【禁止事項】
+        ・「文章のアドバイス」「リライト」「主観的な意見」は一切不要です。
+        ・「問題ありません」等の肯定的な報告、見出しのみの空の報告を禁止します。
+        ・不備がある場合のみ、具体的な箇所を引用して簡潔に報告してください。
         ・不備がなければ『なし』とだけ回答。"""
         
         ai_issue = ""
         try:
             ai_res = model.generate_content(prompt + "\n\nHTMLソース:\n" + res.text[:15000])
-            ai_issue = re.sub(r'<[^>]+>', '', ai_res.text.strip())
-            if any(ok in ai_issue for ok in ["なし", "問題ありません", "適切です"]): ai_issue = ""
+            # Markdownの#などの記号やHTMLタグを物理的に排除
+            ai_issue = re.sub(r'#+', '', ai_res.text.strip())
+            ai_issue = re.sub(r'<[^>]+>', '', ai_issue)
+            if any(ok in ai_issue for ok in ["なし", "問題ありません", "不備は見当たりません"]): ai_issue = ""
         except: ai_issue = "⚠️ AI解析エラー"
 
         final = []
@@ -152,7 +155,7 @@ if uploaded_file and INTERNAL_API_KEY:
     urls = [loc.text.strip().rstrip('/') for loc in BeautifulSoup(content, 'xml').find_all(re.compile(r'loc', re.I))] if uploaded_file.name.endswith(".xml") else [line.strip().rstrip('/') for line in content.splitlines()]
     unique_urls = list(dict.fromkeys([u for u in urls if u.startswith('http')]))
 
-    if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
+    if st.button(f"{len(unique_urls)} ページの検品を開始"):
         results = []
         reported_dead, checked_cache = set(), {}
         prog, status_box = st.progress(0), st.empty()
@@ -165,5 +168,5 @@ if uploaded_file and INTERNAL_API_KEY:
         st.success("検品完了！")
         st.table(pd.DataFrame(results))
         html_rows = "".join([f"<tr><td style='font-size:12px;width:30%;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td><td><span style='color:{'#e74c3c' if '✅' not in r['issue'] else '#333'};'>{r['issue'].replace('\n','<br>')}</span></td></tr>" for r in results])
-        full_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}table{{width:100%;border-collapse:collapse;background:#fff;}}th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}th{{background:#3498db;color:#fff;}}</style></head><body><h1>🔍 {sitemap_stem} 検品レポート</h1><table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
+        full_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}table{{width:100%;border-collapse:collapse;background:#fff;}}th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}th{{background:#3498db;color:#fff;}}</style></head><body><h1>🔍 {sitemap_stem} レポート</h1><table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
         st.download_button(f"📄 レポート保存", data=full_html, file_name=report_name, mime="text/html")
