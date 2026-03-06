@@ -37,7 +37,7 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 50.0 | 行番号表示 ＆ 構造的スペース判定モード")
+st.caption("Ver. 51.0 | 画面レポートHTML同期 ＆ 行番号表示 ＆ メタ資産監視")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -79,7 +79,7 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         soup = BeautifulSoup(raw_html, 'html.parser')
         effective_base = urljoin(res.url, soup.find('base', href=True)['href']) if soup.find('base', href=True) else res.url
         
-        # 資産抽出（Meta/OGP含む）
+        # 資産抽出（Meta/OGP含む強化版）
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
@@ -102,38 +102,25 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                     dead_list.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
-        # --- AI解析用のソース加工（行番号付与） ---
-        numbered_lines = []
-        for i, line in enumerate(raw_html.splitlines()):
-            numbered_lines.append(f"{i+1}: {line}")
-            if i > 1500: break # 解析上限
-        numbered_html = "\n".join(numbered_lines)
+        # 行番号付与
+        numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(raw_html.splitlines())]
+        numbered_html = "\n".join(numbered_lines[:2000])
 
-        # --- AIプロンプト（行番号・構造的スペース対応） ---
+        # AIプロンプト
         prompt = f"""あなたは冷徹なWebデバッグ・プログラムです。URL: {url} のソースを行番号付きで解析し、不備を報告せよ。
-
         【デバッグ項目（必ず [L:行番号] を先頭に付けること）】
-        1. 物理的な文字バグ:
-           ・1文字の誤字（例：お引きたえ、綿密→念密 等）。
-           ・文章内の不自然な空白（例：「発 生」）。
-           ・助詞の重複や脱字（例：「〜をを」、「自分せい」）。
-           ・環境依存文字。
-        2. 表記の不統一: 同一ページ内での「お問い合わせ」と「お問合せ」の混在等。
-        3. 物理的不整合: 電話番号不一致、datetime属性と表示の年の食い違い。
-        4. コピペの痕跡: alt属性や本文に他社名や無関係なサービス名が残っている。
-
-        【スペース判定の特別ルール】
-        ・タイトルやパンくずリスト（例: XXX | XXX | XXX）の区切り文字前後のスペースは「意図的なデザイン」とみなし、スルーせよ。
-        ・それ以外の、通常の文章内での不要なスペース（例: 文章の途中の全角スペース等）は厳しく指摘せよ。
-
-        【禁止事項】
-        ・主観的なアドバイスは一切不要。「問題ありません」等の報告も禁止。
-        ・不備がある場合のみ、[L:行番号] を添えて簡潔に報告。
-        ・不備がなければ『なし』とだけ回答。"""
+        1. 物理的な文字バグ: 誤字（お引きたえ等）、不要な空白（「発 生」）、助詞重複、環境依存文字。
+        2. 表記の不統一: 「お問い合わせ」と「お問合せ」の混在等。
+        3. 物理的不整合: 電話番号不一致、datetime属性ミス。
+        4. コピペの痕跡: alt属性や本文の他社名残り。
+        【スペース判定ルール】
+        ・「 | 」や「 - 」で区切られたタイトル・パンくず内のスペースは「デザイン」としてスルー。それ以外の文章内の不自然なスペースは厳しく指摘。
+        【出力ルール】
+        ・アドバイスや正常報告は不要。不備がある場合のみ簡潔に報告。不備がなければ『なし』。"""
         
         ai_issue = ""
         try:
-            ai_res = model.generate_content(prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:20000])
+            ai_res = model.generate_content(prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:25000])
             ai_issue = re.sub(r'<[^>]+>', '', ai_res.text.strip())
             if any(ok in ai_issue for ok in ["なし", "問題ありません"]): ai_issue = ""
         except: ai_issue = "⚠️ AI解析エラー"
@@ -161,7 +148,7 @@ if uploaded_file and INTERNAL_API_KEY:
     urls = [loc.text.strip().rstrip('/') for loc in BeautifulSoup(content, 'xml').find_all(re.compile(r'loc', re.I))] if uploaded_file.name.endswith(".xml") else [line.strip().rstrip('/') for line in content.splitlines()]
     unique_urls = list(dict.fromkeys([u for u in urls if u.startswith('http')]))
 
-    if st.button(f"{len(unique_urls)} ページの検品を開始"):
+    if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
         results = []
         reported_dead, checked_cache = set(), {}
         prog, status_box = st.progress(0), st.empty()
@@ -172,7 +159,29 @@ if uploaded_file and INTERNAL_API_KEY:
                 results.append(res_data); prog.progress((i + 1) / len(unique_urls)); status_box.text(f"完了: {i+1}/{len(unique_urls)} - {res_data['url']}")
 
         st.success("検品完了！")
-        st.table(pd.DataFrame(results))
-        html_rows = "".join([f"<tr><td style='font-size:12px;width:30%;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td><td><span style='color:{'#e74c3c' if '✅' not in r['issue'] else '#333'};'>{r['issue'].replace('\n','<br>')}</span></td></tr>" for r in results])
-        full_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}table{{width:100%;border-collapse:collapse;background:#fff;}}th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}th{{background:#3498db;color:#fff;}}</style></head><body><h1>🔍 {sitemap_stem} レポート</h1><table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
-        st.download_button(f"📄 レポート保存", data=full_html, file_name=report_name, mime="text/html")
+        
+        # --- 🚀 画面表示用HTMLテーブル生成 ---
+        html_rows = ""
+        for r in results:
+            color = "#e74c3c" if "✅" not in r['issue'] else "#333"
+            html_rows += f"<tr><td style='font-size:12px;width:30%;padding:12px;border:1px solid #eee;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td>"
+            html_rows += f"<td style='padding:12px;border:1px solid #eee;'><span style='color:{color};white-space:pre-wrap;'>{r['issue'].replace('\n','<br>')}</span></td></tr>"
+        
+        full_html_table = f"""
+        <div style="background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.05);">
+            <table style="width:100%; border-collapse:collapse; font-family:sans-serif;">
+                <thead style="background:#3498db; color:#fff;">
+                    <tr><th style="padding:12px; text-align:left;">URL</th><th style="padding:12px; text-align:left;">指摘事項</th></tr>
+                </thead>
+                <tbody>{html_rows}</tbody>
+            </table>
+        </div>
+        """
+        
+        # 画面にHTMLを埋め込む
+        st.write("### 🔍 検品結果プレビュー")
+        st.write(full_html_table, unsafe_allow_html=True)
+        
+        # ダウンロード用HTML全体
+        download_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}table{{width:100%;border-collapse:collapse;background:#fff;}}th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}th{{background:#3498db;color:#fff;}}</style></head><body><h1>🔍 {sitemap_stem} レポート</h1><table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
+        st.download_button(label=f"📄 {report_name} をダウンロード", data=download_html, file_name=report_name, mime="text/html")
