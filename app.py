@@ -37,10 +37,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-# APIキーの取得
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-# --- 3. ネットワーク通信設定 ---
+# --- 3. 通信セッション設定 ---
 def get_session():
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -56,26 +55,42 @@ def get_session():
     session.mount("http://", adapter)
     return session
 
-# --- 4. AIモデル設定 (デバッグ機能強化版) ---
+# --- 4. AIモデル設定 (モデル自動探索機能) ---
 @st.cache_resource
 def load_ai_model(api_key):
     if not api_key:
-        return None, "APIキーが空です。StreamlitのSecretsを確認してください。"
+        return None, "APIキーが設定されていません。"
     try:
         genai.configure(api_key=api_key)
-        # 複数のモデル名パターンを試行
-        candidates = ['gemini-1.5-pro', 'gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-1.5-flash']
-        last_error = ""
-        for m_name in candidates:
-            try:
-                m = genai.GenerativeModel(m_name)
-                # 最小限のテスト
-                m.generate_content("hi", generation_config={"max_output_tokens": 1})
-                return m, None
-            except Exception as e:
-                last_error = str(e)
-                continue
-        return None, f"利用可能なモデルが見つかりませんでした。詳細: {last_error}"
+        
+        # 利用可能なモデルをリストアップ
+        available_models = []
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_models.append(m.name)
+        except Exception as e:
+            return None, f"モデルリストの取得に失敗しました: {str(e)}"
+
+        if not available_models:
+            return None, "使用可能なモデルが見つかりませんでした。APIキーの有効性やリージョンを確認してください。"
+
+        # 優先順位: 1.5 Pro -> 1.5 Flash -> 最初に見つかったもの
+        target_model = None
+        for pref in ["models/gemini-1.5-pro", "models/gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash"]:
+            if pref in available_models:
+                target_model = pref
+                break
+        
+        if not target_model:
+            target_model = available_models[0]
+
+        # モデルの初期化
+        model = genai.GenerativeModel(target_model)
+        # 接続テスト
+        model.generate_content("test", generation_config={"max_output_tokens": 1})
+        return model, None
+        
     except Exception as e:
         return None, f"AI設定エラー: {str(e)}"
 
@@ -91,6 +106,7 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         base_tag = soup.find('base', href=True)
         effective_base = urljoin(res.url, base_tag['href']) if base_tag else res.url
         
+        # 資産の抽出
         assets = set()
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
@@ -100,13 +116,13 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
             if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg']):
                 assets.add(urljoin(effective_base, content))
 
+        # 物理リンク切れチェック
         dead_results = []
         for a_url in assets:
             if a_url not in global_checked_assets:
                 try:
-                    a_res = session.get(a_url, auth=auth_info, timeout=10, verify=False, stream=True)
-                    global_checked_assets[a_url] = a_res.status_code
-                    a_res.close()
+                    with session.get(a_url, auth=auth_info, timeout=10, verify=False, stream=True) as a_res:
+                        global_checked_assets[a_url] = a_res.status_code
                 except:
                     global_checked_assets[a_url] = 999
             
@@ -115,28 +131,28 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                     dead_results.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
+        # AI解析プロンプト (Gemini Advancedの性能をフル活用)
         now_str = datetime.datetime.now().strftime('%Y年%m月')
         prompt = f"現在は{now_str}。URL: {url} を極めて厳格に検品せよ。\n" \
-                 "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース、環境依存文字。\n" \
+                 "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース(半角・全角)、環境依存文字。\n" \
                  "2.不整合:電話番号不一致、他社名混入。\n" \
                  "不備がなければ『なし』とだけ回答せよ。"
         
         ai_issue = ""
         try:
-            response = model.generate_content(prompt + "\n\nソース:\n" + res.text[:15000])
+            response = model.generate_content(prompt + "\n\nHTMLソース:\n" + res.text[:15000])
             ai_issue = response.text.strip()
             if "なし" in ai_issue or "問題ありません" in ai_issue:
                 ai_issue = ""
         except Exception as e:
-            ai_issue = f"⚠️ AI指摘エラー: {str(e)}"
+            ai_issue = f"⚠️ AIエラー: {str(e)}"
 
+        # 合流
         final = []
         if dead_results:
             final.append("**物理エラー**\n" + "\n".join(dead_results))
         if ai_issue:
-            final_content = ai_issue.replace("問題ありません", "").strip()
-            if final_content:
-                final.append("**検品指摘**\n" + final_content)
+            final.append("**検品指摘**\n" + ai_issue)
             
         return {"url": url, "issue": "\n\n".join(final) if final else "✅ 問題なし"}
     except Exception as e:
@@ -150,11 +166,12 @@ b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 uploaded_file = st.file_uploader("URLリスト (.xml または .txt) をアップロード", type=["xml", "txt"])
 
 if uploaded_file and INTERNAL_API_KEY:
+    # ファイル名からレポート名を動的に生成
     sitemap_stem = os.path.splitext(uploaded_file.name)[0]
     date_label = datetime.date.today().strftime('%Y-%m-%d')
     report_name = f"{sitemap_stem}_report_{date_label}.html"
 
-    # モデルのロードとエラー表示
+    # モデルの動的ロード
     model, error_msg = load_ai_model(INTERNAL_API_KEY)
     if error_msg:
         st.error(f"AIモデルの初期化に失敗しました: {error_msg}")
@@ -185,6 +202,7 @@ if uploaded_file and INTERNAL_API_KEY:
         prog = st.progress(0)
         status = st.empty()
         
+        # マルチスレッドによる並列実行
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_url = {executor.submit(inspect_single_page, u, model, session, auth, reported_dead, checked_cache): u for u in unique_urls}
             for i, future in enumerate(as_completed(future_to_url)):
@@ -208,7 +226,7 @@ if uploaded_file and INTERNAL_API_KEY:
                     f"table{{width:100%;border-collapse:collapse;background:#fff;}}" \
                     f"th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}" \
                     f"th{{background:#3498db;color:#fff;}}</style></head><body>" \
-                    f"<h1>🔍 {sitemap_stem} 検品結果</h1>" \
+                    f"<h1>🔍 {sitemap_stem} 検品結果レポート</h1>" \
                     f"<table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table>" \
                     f"</body></html>"
         
