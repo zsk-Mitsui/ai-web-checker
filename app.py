@@ -128,4 +128,79 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         if ai_issue:
             final_list.append("**検品指摘**\n" + ai_issue)
             
-        return {"url": url, "issue": "\n\n".join
+        return {"url": url, "issue": "\n\n".join(final_list) if final_list else "✅ 問題なし"}
+    except Exception as e:
+        return {"url": url, "issue": f"⚠️ エラー発生: {str(e)}"}
+
+# --- 6. メインUI ---
+st.sidebar.title("🛠 設定")
+b_user = st.sidebar.text_input("Basic認証 ユーザー名")
+b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
+
+uploaded_file = st.file_uploader("sitemap.xml をアップロード", type="xml")
+
+if uploaded_file and INTERNAL_API_KEY:
+    # サイトマップファイル名を取得
+    filename_raw = uploaded_file.name
+    sitemap_stem = os.path.splitext(filename_raw)[0]
+    date_label = datetime.date.today().strftime('%Y-%m-%d')
+    report_name = f"{sitemap_stem}_report_{date_label}.html"
+
+    model = load_ai_model(INTERNAL_API_KEY)
+    session = get_session()
+    auth = (b_user, b_pass) if b_user else None
+
+    # Sitemap解析
+    sitemap_data = uploaded_file.read()
+    xml_soup = BeautifulSoup(sitemap_data, 'xml')
+    
+    unique_urls = []
+    for loc in xml_soup.find_all(re.compile(r'loc', re.I)):
+        u = loc.text.strip().rstrip('/')
+        if u.startswith('http') and u not in unique_urls:
+            unique_urls.append(u)
+
+    if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
+        if not model:
+            st.error("AIモデルの初期化に失敗しました。")
+            st.stop()
+            
+        results = []
+        reported_dead = set()
+        checked_cache = {}
+        prog = st.progress(0)
+        status = st.empty()
+        
+        # 並列処理実行
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_url = {executor.submit(inspect_single_page, u, model, session, auth, reported_dead, checked_cache): u for u in unique_urls}
+            for i, future in enumerate(as_completed(future_to_url)):
+                data = future.result()
+                results.append(data)
+                prog.progress((i + 1) / len(unique_urls))
+                status.text(f"完了: {i+1}/{len(unique_urls)} - {data.get('url')}")
+
+        st.success("検品が完了しました！")
+        st.table(pd.DataFrame(results))
+        
+        # HTMLレポート作成
+        html_rows = ""
+        for r in results:
+            text_color = "#333"
+            if "✅" not in r['issue']:
+                text_color = "#e74c3c"
+            
+            issue_br = r['issue'].replace('\n', '<br>')
+            html_rows += f"<tr><td style='font-size:12px;width:30%;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td>"
+            html_rows += f"<td><span style='color:{text_color};'>{issue_br}</span></td></tr>"
+        
+        full_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>" \
+                    f"body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}" \
+                    f"table{{width:100%;border-collapse:collapse;background:#fff;}}" \
+                    f"th,td{{border:1px solid #eee;padding:12px;text-align:left;vertical-align:top;}}" \
+                    f"th{{background:#3498db;color:#fff;}}</style></head><body>" \
+                    f"<h1>🔍 {sitemap_stem} 検品結果</h1>" \
+                    f"<table><thead><tr><th>URL</th><th>指摘事項</th></tr></thead><tbody>{html_rows}</tbody></table>" \
+                    f"</body></html>"
+        
+        st.download_button(label=f"📄 {report_name} をダウンロード", data=full_html, file_name=report_name, mime="text/html")
