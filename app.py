@@ -23,7 +23,6 @@ def check_password():
         st.session_state.password_correct = False
     if st.session_state.password_correct:
         return True
-    
     st.title("🔑 ログイン：Web検品ディレクター Pro")
     pwd = st.text_input("パスワードを入力してください", type="password")
     if st.button("ログイン"):
@@ -37,9 +36,8 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 🚀 ログイン後のタイトル表示 ---
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 49.0 | メタ資産（og:image等）監視 ＆ 高解像度スキャン")
+st.caption("Ver. 50.0 | 行番号表示 ＆ 構造的スペース判定モード")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -77,25 +75,22 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         if res.status_code != 200:
             return {"url": url, "issue": f"⚠️ 読込失敗 ({res.status_code})"}
 
-        soup = BeautifulSoup(res.text, 'html.parser')
+        raw_html = res.text
+        soup = BeautifulSoup(raw_html, 'html.parser')
         effective_base = urljoin(res.url, soup.find('base', href=True)['href']) if soup.find('base', href=True) else res.url
         
-        # 資産の抽出（Meta属性を含む強化版）
+        # 資産抽出（Meta/OGP含む）
         assets = set()
-        # 1. 通常タグ (img, link, script)
         for tag, attr in [('img','src'),('link','href'),('script','src')]:
             for item in soup.find_all(tag, **{attr: True}):
                 assets.add(urljoin(effective_base, item[attr]))
-        
-        # 2. Metaタグ (og:image, twitter:image, etc.)
         for meta in soup.find_all('meta', content=True):
             content = meta['content']
-            # URL形式、または画像拡張子を含むcontentを抽出
             if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg','.ico']):
                 assets.add(urljoin(effective_base, content))
 
-        # リンク切れの死活監視
-        dead_results = []
+        # リンク切れチェック
+        dead_list = []
         for a_url in assets:
             if a_url not in global_checked_assets:
                 try:
@@ -104,43 +99,47 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
                 except: global_checked_assets[a_url] = 999
             if global_checked_assets[a_url] >= 400:
                 if a_url not in reported_dead_assets:
-                    dead_results.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
+                    dead_list.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
                     reported_dead_assets.add(a_url)
 
-        # --- AIプロンプト（高解像度文字列スキャン仕様） ---
-        prompt = f"""あなたは「Webサイトの物理的な記述バグ」を摘出する、極めて冷徹な文字列スキャナーです。
-        URL: {url} のソースを「意味を持つ文章」としてではなく、「一字一句のコード」として精密にスキャンし、以下の不備を特定せよ。
+        # --- AI解析用のソース加工（行番号付与） ---
+        numbered_lines = []
+        for i, line in enumerate(raw_html.splitlines()):
+            numbered_lines.append(f"{i+1}: {line}")
+            if i > 1500: break # 解析上限
+        numbered_html = "\n".join(numbered_lines)
 
-        【デバッグ指示（脳内補完を禁止し、1文字ずつ照合せよ）】
+        # --- AIプロンプト（行番号・構造的スペース対応） ---
+        prompt = f"""あなたは冷徹なWebデバッグ・プログラムです。URL: {url} のソースを行番号付きで解析し、不備を報告せよ。
+
+        【デバッグ項目（必ず [L:行番号] を先頭に付けること）】
         1. 物理的な文字バグ:
-           ・1文字の誤字（例：お引きたえ、Abobe 等）。
-           ・単語内や文中に紛れ込んだ不要な半角・全角スペース（例：「発 生」、「ありません。 お客さま」）。
-           ・助詞の重複や欠落（例：「〜をを快適に」、「自分せい」）。
-           ・文字化け、および環境依存文字（～, ①, ㈱等）。
-        2. 表記の不統一（重大なもの）:
-           ・「お問い合わせ」と「お問合せ」など、同一ページ内での表記揺れ。
-        3. ロジカル不整合:
-           ・ページ内で異なる電話番号が表示されている。
-           ・新着情報の日付とdatetime属性の年が食い違っている。
-        4. コピペの痕跡:
-           ・他社名や無関係なサービス名が残存している。
+           ・1文字の誤字（例：お引きたえ、綿密→念密 等）。
+           ・文章内の不自然な空白（例：「発 生」）。
+           ・助詞の重複や脱字（例：「〜をを」、「自分せい」）。
+           ・環境依存文字。
+        2. 表記の不統一: 同一ページ内での「お問い合わせ」と「お問合せ」の混在等。
+        3. 物理的不整合: 電話番号不一致、datetime属性と表示の年の食い違い。
+        4. コピペの痕跡: alt属性や本文に他社名や無関係なサービス名が残っている。
+
+        【スペース判定の特別ルール】
+        ・タイトルやパンくずリスト（例: XXX | XXX | XXX）の区切り文字前後のスペースは「意図的なデザイン」とみなし、スルーせよ。
+        ・それ以外の、通常の文章内での不要なスペース（例: 文章の途中の全角スペース等）は厳しく指摘せよ。
 
         【禁止事項】
-        ・「文章のアドバイス」「リライト」「主観的な意見」は一切不要です。
-        ・「問題ありません」等の肯定的な報告、見出しのみの空の報告を禁止します。
-        ・不備がある場合のみ、具体的な箇所を引用して簡潔に報告してください。
+        ・主観的なアドバイスは一切不要。「問題ありません」等の報告も禁止。
+        ・不備がある場合のみ、[L:行番号] を添えて簡潔に報告。
         ・不備がなければ『なし』とだけ回答。"""
         
         ai_issue = ""
         try:
-            ai_res = model.generate_content(prompt + "\n\nHTMLソース:\n" + res.text[:15000])
-            ai_issue = re.sub(r'#+', '', ai_res.text.strip())
-            ai_issue = re.sub(r'<[^>]+>', '', ai_issue)
-            if any(ok in ai_issue for ok in ["なし", "問題ありません", "不備は見当たりません"]): ai_issue = ""
+            ai_res = model.generate_content(prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:20000])
+            ai_issue = re.sub(r'<[^>]+>', '', ai_res.text.strip())
+            if any(ok in ai_issue for ok in ["なし", "問題ありません"]): ai_issue = ""
         except: ai_issue = "⚠️ AI解析エラー"
 
         final = []
-        if dead_results: final.append("**物理エラー**\n" + "\n".join(dead_results))
+        if dead_list: final.append("**物理エラー**\n" + "\n".join(dead_list))
         if ai_issue: final.append("**検品指摘**\n" + ai_issue)
         return {"url": url, "issue": "\n\n".join(final) if final else "✅ 問題なし"}
     except Exception as e:
