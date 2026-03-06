@@ -37,6 +37,7 @@ def check_password():
 if not check_password():
     st.stop()
 
+# APIキーの取得
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 # --- 3. ネットワーク通信設定 ---
@@ -55,21 +56,28 @@ def get_session():
     session.mount("http://", adapter)
     return session
 
-# --- 4. AIモデル設定 ---
+# --- 4. AIモデル設定 (デバッグ機能強化版) ---
 @st.cache_resource
 def load_ai_model(api_key):
+    if not api_key:
+        return None, "APIキーが空です。StreamlitのSecretsを確認してください。"
     try:
         genai.configure(api_key=api_key)
-        for m_name in ['gemini-1.5-pro', 'gemini-1.5-flash']:
+        # 複数のモデル名パターンを試行
+        candidates = ['gemini-1.5-pro', 'gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-1.5-flash']
+        last_error = ""
+        for m_name in candidates:
             try:
                 m = genai.GenerativeModel(m_name)
-                m.generate_content("ping", generation_config={"max_output_tokens": 1})
-                return m
-            except:
+                # 最小限のテスト
+                m.generate_content("hi", generation_config={"max_output_tokens": 1})
+                return m, None
+            except Exception as e:
+                last_error = str(e)
                 continue
-        return None
-    except:
-        return None
+        return None, f"利用可能なモデルが見つかりませんでした。詳細: {last_error}"
+    except Exception as e:
+        return None, f"AI設定エラー: {str(e)}"
 
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
@@ -109,35 +117,36 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
 
         now_str = datetime.datetime.now().strftime('%Y年%m月')
         prompt = f"現在は{now_str}。URL: {url} を極めて厳格に検品せよ。\n" \
-                 "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース(半角・全角)、環境依存文字。\n" \
-                 "2.不整合:電話番号の違い、他社名混入、他サイトコピペ残骸。\n" \
+                 "1.文字品質:誤字脱字(お引きたえ等)、不要なスペース、環境依存文字。\n" \
+                 "2.不整合:電話番号不一致、他社名混入。\n" \
                  "不備がなければ『なし』とだけ回答せよ。"
         
         ai_issue = ""
         try:
-            response = model.generate_content(prompt + "\n\nHTMLソース:\n" + res.text[:15000])
+            response = model.generate_content(prompt + "\n\nソース:\n" + res.text[:15000])
             ai_issue = response.text.strip()
             if "なし" in ai_issue or "問題ありません" in ai_issue:
                 ai_issue = ""
         except Exception as e:
-            ai_issue = f"⚠️ AIエラー: {str(e)}"
+            ai_issue = f"⚠️ AI指摘エラー: {str(e)}"
 
-        final_list = []
+        final = []
         if dead_results:
-            final_list.append("**物理エラー**\n" + "\n".join(dead_results))
+            final.append("**物理エラー**\n" + "\n".join(dead_results))
         if ai_issue:
-            final_list.append("**検品指摘**\n" + ai_issue)
+            final_content = ai_issue.replace("問題ありません", "").strip()
+            if final_content:
+                final.append("**検品指摘**\n" + final_content)
             
-        return {"url": url, "issue": "\n\n".join(final_list) if final_list else "✅ 問題なし"}
+        return {"url": url, "issue": "\n\n".join(final) if final else "✅ 問題なし"}
     except Exception as e:
-        return {"url": url, "issue": f"⚠️ エラー発生: {str(e)}"}
+        return {"url": url, "issue": f"⚠️ 解析失敗: {str(e)}"}
 
 # --- 6. メインUI ---
 st.sidebar.title("🛠 設定")
 b_user = st.sidebar.text_input("Basic認証 ユーザー名")
 b_pass = st.sidebar.text_input("Basic認証 パスワード", type="password")
 
-# アップロード可能なファイルを .xml と .txt に拡張
 uploaded_file = st.file_uploader("URLリスト (.xml または .txt) をアップロード", type=["xml", "txt"])
 
 if uploaded_file and INTERNAL_API_KEY:
@@ -145,32 +154,31 @@ if uploaded_file and INTERNAL_API_KEY:
     date_label = datetime.date.today().strftime('%Y-%m-%d')
     report_name = f"{sitemap_stem}_report_{date_label}.html"
 
-    model = load_ai_model(INTERNAL_API_KEY)
+    # モデルのロードとエラー表示
+    model, error_msg = load_ai_model(INTERNAL_API_KEY)
+    if error_msg:
+        st.error(f"AIモデルの初期化に失敗しました: {error_msg}")
+        st.stop()
+
     session = get_session()
     auth = (b_user, b_pass) if b_user else None
 
-    # ファイル形式に応じたURL解析
+    # ファイル解析
     raw_content = uploaded_file.read().decode("utf-8")
     unique_urls = []
-    
     if uploaded_file.name.endswith(".xml"):
-        soup = BeautifulSoup(raw_content, 'xml')
-        for loc in soup.find_all(re.compile(r'loc', re.I)):
+        xml_soup = BeautifulSoup(raw_content, 'xml')
+        for loc in xml_soup.find_all(re.compile(r'loc', re.I)):
             u = loc.text.strip().rstrip('/')
             if u.startswith('http') and u not in unique_urls:
                 unique_urls.append(u)
     else:
-        # .txt の場合は1行1URLとして処理
         for line in raw_content.splitlines():
             u = line.strip().rstrip('/')
             if u.startswith('http') and u not in unique_urls:
                 unique_urls.append(u)
 
     if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
-        if not model:
-            st.error("AIモデルの初期化に失敗しました。")
-            st.stop()
-            
         results = []
         reported_dead = set()
         checked_cache = {}
@@ -185,19 +193,15 @@ if uploaded_file and INTERNAL_API_KEY:
                 prog.progress((i + 1) / len(unique_urls))
                 status.text(f"完了: {i+1}/{len(unique_urls)} - {data.get('url')}")
 
-        st.success("検品が完了しました！")
+        st.success("検品完了！")
         st.table(pd.DataFrame(results))
         
         # HTMLレポート作成
         html_rows = ""
         for r in results:
-            text_color = "#333"
-            if "✅" not in r['issue']:
-                text_color = "#e74c3c"
-            
-            issue_br = r['issue'].replace('\n', '<br>')
+            text_color = "#e74c3c" if "✅" not in r['issue'] else "#333"
             html_rows += f"<tr><td style='font-size:12px;width:30%;'><a href='{r['url']}' target='_blank'>{r['url']}</a></td>"
-            html_rows += f"<td><span style='color:{text_color};'>{issue_br}</span></td></tr>"
+            html_rows += f"<td><span style='color:{text_color};'>{r['issue'].replace('\n','<br>')}</span></td></tr>"
         
         full_html = f"<!DOCTYPE html><html><head><meta charset='UTF-8'><style>" \
                     f"body{{font-family:sans-serif;padding:20px;background:#f4f7f9;}}" \
