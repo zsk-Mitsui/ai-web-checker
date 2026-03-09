@@ -9,7 +9,7 @@ import urllib3
 import ssl
 import datetime
 import os
-import html as html_lib  # 特殊文字処理用
+import html as html_lib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -38,7 +38,7 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 52.0 | エラー回避エスケープ実装 ＆ 大容量対応 ＆ メタ資産監視")
+st.caption("Ver. 53.0 | 全角スペース除外 ＆ 住所スペース許容 ＆ 特殊文字回避")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -107,17 +107,27 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(raw_html.splitlines())]
         numbered_html = "\n".join(numbered_lines[:2000])
 
-        # AIプロンプト
+        # --- AIプロンプト（Ver. 53.0 スペース判定高度化仕様） ---
         prompt = f"""あなたは冷徹なWebデバッグ・プログラムです。URL: {url} のソースを行番号付きで解析し、不備を報告せよ。
+
         【デバッグ項目（必ず [L:行番号] を先頭に付けること）】
-        1. 物理的な文字バグ: 誤字（お引きたえ等）、不要な空白（「発 生」）、助詞重複、環境依存文字。
+        1. 物理的な文字バグ:
+           ・1文字の誤字（例：お引きたえ、綿密→念密 等）。
+           ・文章内の不自然な空白（例：「発 生」）。
+           ・助詞の重複や脱字（例：「〜をを」、「自分せい」）。
+           ・文字化け、および環境依存文字。
         2. 表記の不統一: 「お問い合わせ」と「お問合せ」の混在等。
         3. 物理的不整合: 電話番号不一致、datetime属性ミス。
         4. コピペの痕跡: alt属性や本文の他社名残り。
-        【スペース判定ルール】
-        ・「 | 」や「 - 」で区切られたタイトル・パンくず内のスペースは「デザイン」としてスルー。それ以外の文章内の不自然なスペースは厳しく指摘。
-        【禁止事項】
-        ・主観的なアドバイスや正常報告は不要。不備がある場合のみ簡潔に報告。不備がなければ『なし』。"""
+
+        【スペース判定の除外・許容ルール】
+        ・「全角スペース」はデザイン意図とみなし、一切指摘するな。
+        ・「住所の番地 ＋ 半角スペース ＋ ビル名」のパターンは正常な区切りであり、指摘するな。
+        ・「 | 」や「 - 」で区切られたタイトル・パンくず内の半角スペースはスルーせよ。
+        ・上記以外の、通常の文章や単語の途中に紛れ込んだ不自然な「半角スペース」のみを指摘せよ。
+
+        【出力ルール】
+        ・アドバイスや正常報告は不要。不備がある場合のみ簡潔に報告。不備がなければ『なし』。"""
         
         ai_issue = ""
         try:
@@ -161,15 +171,11 @@ if uploaded_file and INTERNAL_API_KEY:
 
         st.success("検品完了！")
         
-        # --- 🚀 安全なHTMLテーブル生成 (エスケープ処理追加) ---
         html_rows = ""
         for r in results:
             color = "#e74c3c" if "✅" not in r['issue'] else "#333"
-            # URLと指摘事項を安全にエスケープしてから埋め込む
             safe_url = html_lib.escape(r['url'])
-            # 指摘事項はエスケープしてから改行だけ<br>に戻す
             safe_issue = html_lib.escape(r['issue']).replace('\n', '<br>')
-            
             html_rows += f"<tr><td style='font-size:12px;width:30%;padding:12px;border:1px solid #eee;'><a href='{safe_url}' target='_blank'>{safe_url}</a></td>"
             html_rows += f"<td style='padding:12px;border:1px solid #eee;'><span style='color:{color};white-space:pre-wrap;'>{safe_issue}</span></td></tr>"
         
