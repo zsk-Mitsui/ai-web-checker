@@ -38,14 +38,24 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 55.0 | 具体的引用モード ＆ 行番号表示 ＆ 日付・メタ資産監視")
+st.caption("Ver. 56.0 | 耐タイムアウト・接続安定化 ＆ 具体的引用モード")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 # --- 3. ネットワーク設定 ---
 def get_session():
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    # 一般的なPCブラウザのUser-Agentを設定してブロックを回避
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+    })
+    retries = Retry(
+        total=2,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
     class SimpleSSLAdapter(HTTPAdapter):
         def init_poolmanager(self, *args, **kwargs):
             ctx = ssl.create_default_context()
@@ -53,6 +63,7 @@ def get_session():
             ctx.verify_mode = ssl.CERT_NONE
             kwargs['ssl_context'] = ctx
             return super().init_poolmanager(*args, **kwargs)
+            
     adapter = SimpleSSLAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -66,15 +77,17 @@ def load_ai_model(api_key):
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         target = next((m for m in ["models/gemini-1.5-pro", "models/gemini-1.5-flash"] if m in available_models), available_models[0] if available_models else None)
         return genai.GenerativeModel(target) if target else None
-    except: return None
+    except:
+        return None
 
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
     try:
-        res = session.get(url, auth=auth_info, timeout=20, verify=False)
+        # 接続(10s)と読み込み(30s)を分離し、サーバー応答遅延に対応
+        res = session.get(url, auth=auth_info, timeout=(10, 30), verify=False)
         res.encoding = res.apparent_encoding
         if res.status_code != 200:
-            return {"url": url, "issue": f"⚠️ 読込失敗 ({res.status_code})"}
+            return {"url": url, "issue": f"⚠️ 読込失敗 (ステータス: {res.status_code})"}
 
         raw_html = res.text
         soup = BeautifulSoup(raw_html, 'html.parser')
@@ -95,9 +108,10 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         for a_url in assets:
             if a_url not in global_checked_assets:
                 try:
-                    with session.get(a_url, auth=auth_info, timeout=10, verify=False, stream=True) as a_res:
+                    with session.get(a_url, auth=auth_info, timeout=(5, 10), verify=False, stream=True) as a_res:
                         global_checked_assets[a_url] = a_res.status_code
-                except: global_checked_assets[a_url] = 999
+                except:
+                    global_checked_assets[a_url] = 999
             if global_checked_assets[a_url] >= 400:
                 if a_url not in reported_dead_assets:
                     dead_list.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
@@ -107,7 +121,6 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(raw_html.splitlines())]
         numbered_html = "\n".join(numbered_lines[:2000])
 
-        # --- AIプロンプト（Ver. 55.0 具体的引用徹底仕様） ---
         prompt = f"""あなたは冷徹なWebデバッグ・プログラムです。URL: {url} のソースを行番号付きで解析し、不備を報告せよ。
 
         【デバッグ項目と報告形式】
@@ -137,13 +150,22 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         try:
             ai_res = model.generate_content(prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:25000])
             ai_issue = html_lib.escape(ai_res.text.strip())
-            if any(ok in ai_issue for ok in ["なし", "問題ありません"]): ai_issue = ""
-        except: ai_issue = "⚠️ AI解析エラー"
+            if any(ok in ai_issue for ok in ["なし", "問題ありません"]): 
+                ai_issue = ""
+        except:
+            ai_issue = "⚠️ AI解析エラー"
 
         final = []
-        if dead_list: final.append("**物理エラー**\n" + "\n".join(dead_list))
-        if ai_issue: final.append("**検品指摘**\n" + ai_issue)
+        if dead_list:
+            final.append("**物理エラー**\n" + "\n".join(dead_list))
+        if ai_issue:
+            final.append("**検品指摘**\n" + ai_issue)
         return {"url": url, "issue": "\n\n".join(final) if final else "✅ 問題なし"}
+
+    except requests.exceptions.Timeout:
+        return {"url": url, "issue": "⚠️ サーバー接続タイムアウト（応答なし）"}
+    except requests.exceptions.RequestException as e:
+        return {"url": url, "issue": f"⚠️ 通信エラー: {str(e)}"}
     except Exception as e:
         return {"url": url, "issue": f"⚠️ 解析エラー: {str(e)}"}
 
@@ -157,7 +179,9 @@ if uploaded_file and INTERNAL_API_KEY:
     sitemap_stem = os.path.splitext(uploaded_file.name)[0]
     report_name = f"{sitemap_stem}_report_{datetime.date.today()}.html"
     model = load_ai_model(INTERNAL_API_KEY)
-    if not model: st.error("AIモデル初期化失敗"); st.stop()
+    if not model:
+        st.error("AIモデル初期化失敗")
+        st.stop()
 
     content = uploaded_file.read().decode("utf-8")
     urls = [loc.text.strip().rstrip('/') for loc in BeautifulSoup(content, 'xml').find_all(re.compile(r'loc', re.I))] if uploaded_file.name.endswith(".xml") else [line.strip().rstrip('/') for line in content.splitlines()]
@@ -167,11 +191,15 @@ if uploaded_file and INTERNAL_API_KEY:
         results = []
         reported_dead, checked_cache = set(), {}
         prog, status_box = st.progress(0), st.empty()
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        
+        # 相手サーバーへの負荷軽減のため同時リクエスト数を3に調整
+        with ThreadPoolExecutor(max_workers=3) as executor:
             tasks = {executor.submit(inspect_single_page, u, model, get_session(), (b_user, b_pass) if b_user else None, reported_dead, checked_cache): u for u in unique_urls}
             for i, future in enumerate(as_completed(tasks)):
                 res_data = future.result()
-                results.append(res_data); prog.progress((i + 1) / len(unique_urls)); status_box.text(f"完了: {i+1}/{len(unique_urls)} - {res_data['url']}")
+                results.append(res_data)
+                prog.progress((i + 1) / len(unique_urls))
+                status_box.text(f"完了: {i+1}/{len(unique_urls)} - {res_data['url']}")
 
         st.success("検品完了！")
         
@@ -179,7 +207,6 @@ if uploaded_file and INTERNAL_API_KEY:
         for r in results:
             color = "#e74c3c" if "✅" not in r['issue'] else "#333"
             safe_url = html_lib.escape(r['url'])
-            # 改行を<br>に変換（指摘事項自体はinspect_single_page内でescape済み）
             formatted_issue = r['issue'].replace('\n', '<br>')
             html_rows += f"<tr><td style='font-size:12px;width:30%;padding:12px;border:1px solid #eee;'><a href='{safe_url}' target='_blank'>{safe_url}</a></td>"
             html_rows += f"<td style='padding:12px;border:1px solid #eee;'><span style='color:{color};white-space:pre-wrap;'>{formatted_issue}</span></td></tr>"
