@@ -39,7 +39,7 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 57.0 | AIリトライ機能・エラー詳細可視化 ＆ 接続安定化")
+st.caption("Ver. 58.0 | フリーズ防止・高速HEADチェック ＆ リアルタイムステータス")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -51,9 +51,9 @@ def get_session():
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     })
     retries = Retry(
-        total=2,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
+        total=1,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
         raise_on_status=False
     )
     class SimpleSSLAdapter(HTTPAdapter):
@@ -81,11 +81,11 @@ def load_ai_model(api_key):
         return None
 
 # --- AIリトライ関数 ---
-def generate_ai_content_with_retry(model, full_prompt, max_retries=3):
+def generate_ai_content_with_retry(model, full_prompt, max_retries=2):
     last_err = ""
     for attempt in range(max_retries):
         try:
-            res = model.generate_content(full_prompt)
+            res = model.generate_content(full_prompt, request_options={"timeout": 45})
             if not res.candidates or not res.text:
                 if res.prompt_feedback and res.prompt_feedback.block_reason:
                     return "", f"AIブロック ({res.prompt_feedback.block_reason})"
@@ -94,8 +94,7 @@ def generate_ai_content_with_retry(model, full_prompt, max_retries=3):
         except Exception as e:
             err_str = str(e)
             last_err = err_str
-            # レートリミット (429) または一時エラーの場合は待機して再試行
-            if "429" in err_str or "quota" in err_str.lower() or "resource" in err_str.lower():
+            if "429" in err_str or "quota" in err_str.lower():
                 time.sleep(2 * (attempt + 1))
             else:
                 time.sleep(1)
@@ -104,7 +103,8 @@ def generate_ai_content_with_retry(model, full_prompt, max_retries=3):
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
     try:
-        res = session.get(url, auth=auth_info, timeout=(10, 30), verify=False)
+        # メインHTML取得（接続5秒、読込15秒で短縮）
+        res = session.get(url, auth=auth_info, timeout=(5, 15), verify=False)
         res.encoding = res.apparent_encoding
         if res.status_code != 200:
             return {"url": url, "issue": f"⚠️ 読込失敗 (ステータス: {res.status_code})"}
@@ -123,15 +123,19 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
             if content.startswith(('http', '/', '.')) or any(ext in content.lower() for ext in ['.jpg','.png','.webp','.svg','.ico']):
                 assets.add(urljoin(effective_base, content))
 
-        # リンク切れチェック
+        # リンク切れチェック（HEADリクエスト優先でタイムアウト3秒）
         dead_list = []
         for a_url in assets:
             if a_url not in global_checked_assets:
                 try:
-                    with session.get(a_url, auth=auth_info, timeout=(5, 10), verify=False, stream=True) as a_res:
-                        global_checked_assets[a_url] = a_res.status_code
+                    # まずHEADで素早く存在チェック、拒否されたらGET
+                    a_res = session.head(a_url, auth=auth_info, timeout=3, verify=False, allow_redirects=True)
+                    if a_res.status_code in [404, 405]:
+                        a_res = session.get(a_url, auth=auth_info, timeout=3, verify=False, stream=True)
+                    global_checked_assets[a_url] = a_res.status_code
                 except:
                     global_checked_assets[a_url] = 999
+
             if global_checked_assets[a_url] >= 400:
                 if a_url not in reported_dead_assets:
                     dead_list.append(f"❌ リンク切れ({global_checked_assets[a_url]}): {a_url}")
@@ -200,22 +204,28 @@ uploaded_file = st.file_uploader("URLリスト (.xml または .txt)", type=["xm
 
 if uploaded_file and INTERNAL_API_KEY:
     sitemap_stem = os.path.splitext(uploaded_file.name)[0]
-    report_name = f"{sitemap_stem}_report_{datetime.date.today()}.html"
+    date_str = datetime.date.today().strftime('%Y-%m-%d')
+    report_name = f"{sitemap_stem}_report_{date_str}.html"
+    
     model = load_ai_model(INTERNAL_API_KEY)
     if not model:
-        st.error("AIモデル初期化失敗")
+        st.error("AIモデル初期化失敗。APIキーの設定を確認してください。")
         st.stop()
 
     content = uploaded_file.read().decode("utf-8")
     urls = [loc.text.strip().rstrip('/') for loc in BeautifulSoup(content, 'xml').find_all(re.compile(r'loc', re.I))] if uploaded_file.name.endswith(".xml") else [line.strip().rstrip('/') for line in content.splitlines()]
     unique_urls = list(dict.fromkeys([u for u in urls if u.startswith('http')]))
 
+    if not unique_urls:
+        st.warning("有効なURL（httpから始まるURL）が見つかりませんでした。テキストまたはXMLの内容を確認してください。")
+
     if st.button(f"{len(unique_urls)} ページの並列検品を開始"):
         results = []
         reported_dead, checked_cache = set(), {}
-        prog, status_box = st.progress(0), st.empty()
-        
-        # レートリミット回避のため max_workers=2 に設定
+        prog = st.progress(0)
+        status_box = st.empty()
+        status_box.info("🚀 接続と検品処理を開始しています...")
+
         with ThreadPoolExecutor(max_workers=2) as executor:
             tasks = {executor.submit(inspect_single_page, u, model, get_session(), (b_user, b_pass) if b_user else None, reported_dead, checked_cache): u for u in unique_urls}
             for i, future in enumerate(as_completed(tasks)):
@@ -224,6 +234,7 @@ if uploaded_file and INTERNAL_API_KEY:
                 prog.progress((i + 1) / len(unique_urls))
                 status_box.text(f"完了: {i+1}/{len(unique_urls)} - {res_data['url']}")
 
+        status_box.empty()
         st.success("検品完了！")
         
         html_rows = ""
