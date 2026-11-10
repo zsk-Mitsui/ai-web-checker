@@ -9,6 +9,7 @@ import urllib3
 import ssl
 import datetime
 import os
+import time
 import html as html_lib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
@@ -38,14 +39,13 @@ if not check_password():
     st.stop()
 
 st.title("🔍 Web検品ディレクター Pro")
-st.caption("Ver. 56.0 | 耐タイムアウト・接続安定化 ＆ 具体的引用モード")
+st.caption("Ver. 57.0 | AIリトライ機能・エラー詳細可視化 ＆ 接続安定化")
 
 INTERNAL_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 # --- 3. ネットワーク設定 ---
 def get_session():
     session = requests.Session()
-    # 一般的なPCブラウザのUser-Agentを設定してブロックを回避
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
@@ -80,10 +80,30 @@ def load_ai_model(api_key):
     except:
         return None
 
+# --- AIリトライ関数 ---
+def generate_ai_content_with_retry(model, full_prompt, max_retries=3):
+    last_err = ""
+    for attempt in range(max_retries):
+        try:
+            res = model.generate_content(full_prompt)
+            if not res.candidates or not res.text:
+                if res.prompt_feedback and res.prompt_feedback.block_reason:
+                    return "", f"AIブロック ({res.prompt_feedback.block_reason})"
+                return "", "空の応答"
+            return res.text.strip(), None
+        except Exception as e:
+            err_str = str(e)
+            last_err = err_str
+            # レートリミット (429) または一時エラーの場合は待機して再試行
+            if "429" in err_str or "quota" in err_str.lower() or "resource" in err_str.lower():
+                time.sleep(2 * (attempt + 1))
+            else:
+                time.sleep(1)
+    return "", last_err
+
 # --- 5. 個別ページ検品エンジン ---
 def inspect_single_page(url, model, session, auth_info, reported_dead_assets, global_checked_assets):
     try:
-        # 接続(10s)と読み込み(30s)を分離し、サーバー応答遅延に対応
         res = session.get(url, auth=auth_info, timeout=(10, 30), verify=False)
         res.encoding = res.apparent_encoding
         if res.status_code != 200:
@@ -146,14 +166,17 @@ def inspect_single_page(url, model, session, auth_info, reported_dead_assets, gl
         ・アドバイス、正常報告（問題ありません等）、空の見出し出力は禁止。
         ・不備がなければ『なし』。"""
         
-        ai_issue = ""
-        try:
-            ai_res = model.generate_content(prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:25000])
-            ai_issue = html_lib.escape(ai_res.text.strip())
+        full_prompt = prompt + "\n\n行番号付きHTMLソース:\n" + numbered_html[:25000]
+        
+        ai_raw_text, ai_err = generate_ai_content_with_retry(model, full_prompt)
+        
+        if ai_err:
+            short_err = ai_err[:120].replace('\n', ' ')
+            ai_issue = f"⚠️ AI解析エラー: {short_err}"
+        else:
+            ai_issue = html_lib.escape(ai_raw_text)
             if any(ok in ai_issue for ok in ["なし", "問題ありません"]): 
                 ai_issue = ""
-        except:
-            ai_issue = "⚠️ AI解析エラー"
 
         final = []
         if dead_list:
@@ -192,8 +215,8 @@ if uploaded_file and INTERNAL_API_KEY:
         reported_dead, checked_cache = set(), {}
         prog, status_box = st.progress(0), st.empty()
         
-        # 相手サーバーへの負荷軽減のため同時リクエスト数を3に調整
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        # レートリミット回避のため max_workers=2 に設定
+        with ThreadPoolExecutor(max_workers=2) as executor:
             tasks = {executor.submit(inspect_single_page, u, model, get_session(), (b_user, b_pass) if b_user else None, reported_dead, checked_cache): u for u in unique_urls}
             for i, future in enumerate(as_completed(tasks)):
                 res_data = future.result()
